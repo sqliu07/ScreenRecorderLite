@@ -1,0 +1,84 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 25,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "windows-base",
+      "hidden": true,
+      "toolchainFile": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
+      "cacheVariables": {
+        "VCPKG_TARGET_TRIPLET": "x64-windows-static",
+        "VCPKG_OVERLAY_TRIPLETS": "${sourceDir}/cmake/triplets",
+        "VCPKG_INSTALLED_DIR": "${sourceDir}/out/vcpkg_installed"
+      }
+    },
+    {
+      "name": "windows",
+      "displayName": "Windows x64 (Ninja + MSVC)",
+      "inherits": "windows-base",
+      "generator": "Ninja Multi-Config",
+      "binaryDir": "${sourceDir}/out/build/windows",
+      "cacheVariables": {
+        "CMAKE_CXX_COMPILER": "cl",
+        "CMAKE_CONFIGURATION_TYPES": "Debug;Release"
+      }
+    },
+    {
+      "name": "vs2022",
+      "displayName": "Visual Studio 2022 x64 (optional)",
+      "inherits": "windows-base",
+      "generator": "Visual Studio 17 2022",
+      "architecture": "x64",
+      "binaryDir": "${sourceDir}/out/build/vs2022"
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "debug",
+      "configurePreset": "windows",
+      "jobs": 4,
+      "configuration": "Debug"
+    },
+    {
+      "name": "release",
+      "configurePreset": "windows",
+      "jobs": 4,
+      "configuration": "Release"
+    },
+    {
+      "name": "release-vs2022",
+      "configurePreset": "vs2022",
+      "configuration": "Release"
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "debug",
+      "configurePreset": "windows",
+      "configuration": "Debug",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "release",
+      "configurePreset": "windows",
+      "configuration": "Release",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "release-vs2022",
+      "configurePreset": "vs2022",
+      "configuration": "Release",
+      "output": {
+        "outputOnFailure": true
+      }
+    }
+  ]
+}

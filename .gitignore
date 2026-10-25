@@ -1,0 +1,32 @@
+# Build output
+/out/
+/build/
+/vcpkg_installed/
+/.vs/
+*.user
+*.suo
+*.VC.db
+*.opendb
+*.ipch
+CMakeUserPresets.json
+
+# Probe artifacts
+/artifacts/
+Recording_*.mp4
+Recording_*.m4a
+Shot_*.png
+*.tmp
+
+# OS clutter
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# Codex session and local release staging
+/.omx/
+/publish/
+
+# Local development records are not part of the public project.
+/docs/
+/BUILDING.md
+/ACCEPTANCE.md

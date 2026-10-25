@@ -1,0 +1,119 @@
+name: Windows Release
+
+on:
+  push:
+    tags: ['v*.*.*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing vX.Y.Z tag to publish
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: windows-release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  VCPKG_BINARY_SOURCES: clear
+  VCPKG_MAX_CONCURRENCY: 4
+
+jobs:
+  build-and-publish:
+    runs-on: windows-2022
+    timeout-minutes: 120
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - name: Validate license and version
+        shell: pwsh
+        run: |
+          if (-not (Test-Path LICENSE)) { throw 'The project LICENSE is missing.' }
+          $tag = $env:RELEASE_TAG
+          if ($tag -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+$') { throw 'Expected a vX.Y.Z release tag.' }
+          $versionLine = Select-String -Path CMakeLists.txt -Pattern '^project\(ScreenRecorderLite VERSION ([0-9]+\.[0-9]+\.[0-9]+)'
+          if (-not $versionLine) { throw 'Could not read the CMake project version.' }
+          if ($tag -ne "v$($versionLine.Matches[0].Groups[1].Value)") { throw 'Release tag does not match the CMake project version.' }
+      - name: Prepare pinned vcpkg
+        shell: pwsh
+        run: |
+          if (-not $env:VCPKG_INSTALLATION_ROOT) { throw 'VCPKG_INSTALLATION_ROOT is unavailable on this runner.' }
+          $baseline = (Get-Content vcpkg.json -Raw | ConvertFrom-Json).'builtin-baseline'
+          git -C $env:VCPKG_INSTALLATION_ROOT fetch origin $baseline --depth=1
+          if ($LASTEXITCODE -ne 0) { throw 'Could not fetch the pinned vcpkg baseline.' }
+          git -C $env:VCPKG_INSTALLATION_ROOT checkout --detach $baseline
+          if ($LASTEXITCODE -ne 0) { throw 'Could not select the pinned vcpkg baseline.' }
+          & "$env:VCPKG_INSTALLATION_ROOT/bootstrap-vcpkg.bat" -disableMetrics
+          if ($LASTEXITCODE -ne 0) { throw 'Could not bootstrap the pinned vcpkg tool.' }
+          "VCPKG_ROOT=$env:VCPKG_INSTALLATION_ROOT" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "VCPKG_DOWNLOADS=$env:RUNNER_TEMP/vcpkg-downloads" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Cache dependency downloads
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.VCPKG_DOWNLOADS }}
+          key: ${{ runner.os }}-vcpkg-downloads-${{ hashFiles('vcpkg.json', 'cmake/triplets/**') }}
+          restore-keys: ${{ runner.os }}-vcpkg-downloads-
+      - name: Build Release with Ninja and detected MSVC
+        shell: cmd
+        run: call scripts\build.cmd --skip-tests
+      - name: Run CTest suite
+        run: ctest --preset release --output-on-failure
+      - name: Package portable app and FFmpeg source
+        shell: pwsh
+        run: ./scripts/package-release.ps1 -OutputDirectory "$env:RUNNER_TEMP/release-assets"
+      - name: Upload release build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-assets-${{ env.RELEASE_TAG }}
+          path: ${{ runner.temp }}/release-assets/*
+          if-no-files-found: error
+          compression-level: 0
+      - name: Publish GitHub release
+        shell: pwsh
+        run: |
+          $tag = $env:RELEASE_TAG
+          $assets = @(Get-ChildItem "$env:RUNNER_TEMP/release-assets" -File | ForEach-Object FullName)
+          if ($assets.Count -ne 4) { throw 'Expected portable ZIP, FFmpeg source archive and their two checksums.' }
+          $notes = ".github/release-notes/$tag.md"
+          if (-not (Test-Path $notes)) {
+            $notes = Join-Path $env:RUNNER_TEMP 'release-notes.md'
+            @(
+              "ScreenRecorderLite $tag for Windows x64.",
+              '',
+              'Download ScreenRecorderLite-win-x64.zip, extract the complete folder and run ScreenRecorderLite.exe. Keep all extracted files together.',
+              '',
+              'SHA-256 checksums and the corresponding FFmpeg source are included in the release assets.'
+            ) | Set-Content -Encoding UTF8 $notes
+          }
+          gh release view $tag --json isDraft 1>$null 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag @assets --clobber
+            if ($LASTEXITCODE -ne 0) { throw 'Could not upload release assets.' }
+            $edit = @('release', 'edit', $tag, '--draft=false', '--title', "ScreenRecorderLite $tag", '--notes-file', $notes)
+            $edit += if ($tag -match '^v0\.') { '--prerelease' } else { '--prerelease=false' }
+            & gh @edit
+          } else {
+            $create = @('release', 'create', $tag) + $assets + @('--verify-tag', '--title', "ScreenRecorderLite $tag")
+            $create += @('--notes-file', $notes)
+            if ($tag -match '^v0\.') { $create += @('--prerelease', '--latest=false') }
+            & gh @create
+          }
+          if ($LASTEXITCODE -ne 0) { throw 'Could not publish the GitHub release.' }
+          gh release view $tag --json url --jq .url
+      - name: Upload build diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-build-diagnostics
+          path: |
+            out/build/windows/vcpkg-manifest-install.log
+            out/build/windows/CMakeFiles/CMakeConfigureLog.yaml
+            ${{ env.VCPKG_ROOT }}/buildtrees/ffmpeg/*.log
+          if-no-files-found: ignore

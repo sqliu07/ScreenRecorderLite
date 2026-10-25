@@ -1,0 +1,12 @@
+// RT_MANIFEST is 24; define it so rc.exe emits a manifest resource even
+// without pulling in winuser.h.
+#define RT_MANIFEST 24
+
+// Embedded by RC so the manifest is part of the executable resources.
+// The build disables the linker-generated manifest (/MANIFEST:NO) to avoid a
+// duplicate RT_MANIFEST resource with conflicting settings.
+1 RT_MANIFEST "@SRL_MANIFEST_FILE_CMAKE@"
+
+// Application icon. The ID must match src/app/resource.h.
+#define IDI_APP_ICON 101
+IDI_APP_ICON ICON "@SRL_ICON_FILE_CMAKE@"

@@ -1,0 +1,71 @@
+name: Windows CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  VCPKG_BINARY_SOURCES: clear
+  VCPKG_MAX_CONCURRENCY: 4
+
+jobs:
+  release-build:
+    runs-on: windows-2022
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prepare pinned vcpkg
+        shell: pwsh
+        run: |
+          if (-not $env:VCPKG_INSTALLATION_ROOT) { throw 'VCPKG_INSTALLATION_ROOT is unavailable on this runner.' }
+          $baseline = (Get-Content vcpkg.json -Raw | ConvertFrom-Json).'builtin-baseline'
+          git -C $env:VCPKG_INSTALLATION_ROOT fetch origin $baseline --depth=1
+          if ($LASTEXITCODE -ne 0) { throw 'Could not fetch the pinned vcpkg baseline.' }
+          git -C $env:VCPKG_INSTALLATION_ROOT checkout --detach $baseline
+          if ($LASTEXITCODE -ne 0) { throw 'Could not select the pinned vcpkg baseline.' }
+          & "$env:VCPKG_INSTALLATION_ROOT/bootstrap-vcpkg.bat" -disableMetrics
+          if ($LASTEXITCODE -ne 0) { throw 'Could not bootstrap the pinned vcpkg tool.' }
+          "VCPKG_ROOT=$env:VCPKG_INSTALLATION_ROOT" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "VCPKG_DOWNLOADS=$env:RUNNER_TEMP/vcpkg-downloads" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Cache dependency downloads
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.VCPKG_DOWNLOADS }}
+          key: ${{ runner.os }}-vcpkg-downloads-${{ hashFiles('vcpkg.json', 'cmake/triplets/**') }}
+          restore-keys: ${{ runner.os }}-vcpkg-downloads-
+      - name: Build Release with Ninja and detected MSVC
+        shell: cmd
+        run: call scripts\build.cmd --skip-tests
+      - name: Run CTest suite
+        run: ctest --preset release --output-on-failure
+      - name: Package portable app and FFmpeg source
+        shell: pwsh
+        run: ./scripts/package-release.ps1 -OutputDirectory "$env:RUNNER_TEMP/release-assets"
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ScreenRecorderLite-win-x64
+          path: ${{ runner.temp }}/release-assets/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+      - name: Upload build diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-build-diagnostics
+          path: |
+            out/build/windows/vcpkg-manifest-install.log
+            out/build/windows/CMakeFiles/CMakeConfigureLog.yaml
+            ${{ env.VCPKG_ROOT }}/buildtrees/ffmpeg/*.log
+          if-no-files-found: ignore
