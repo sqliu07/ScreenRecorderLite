@@ -50,7 +50,11 @@ scripts\build.cmd
 ```
 
 vcpkg downloads and builds the required FFmpeg libraries on the first build.
+Use a full Git checkout of vcpkg (`git clone https://github.com/microsoft/vcpkg.git`); the pinned dependency baseline requires its Git history.
+
 The source archive contains no prebuilt libraries; installing `ffmpeg.exe` is unnecessary.
+
+If you changed the vcpkg path or dependency directory, run `scripts\build.cmd --fresh` to clear the old configuration and rebuild.
 
 Run `out\build\windows\Release\ScreenRecorderLite.exe` and keep the FFmpeg DLLs beside it.
 

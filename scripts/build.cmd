@@ -2,16 +2,40 @@
 setlocal
 pushd "%~dp0.."
 
-if not "%~1"=="" if /I not "%~1"=="--skip-tests" (
-    echo Usage: scripts\build.cmd [--skip-tests]
-    goto :fail
+set "SRL_FRESH_CONFIGURE="
+set "SRL_SKIP_TESTS="
+:parse_args
+if "%~1"=="" goto :args_parsed
+if /I "%~1"=="--fresh" (
+    set "SRL_FRESH_CONFIGURE=--fresh"
+    shift /1
+    goto :parse_args
 )
+if /I "%~1"=="--skip-tests" (
+    set "SRL_SKIP_TESTS=1"
+    shift /1
+    goto :parse_args
+)
+echo Usage: scripts\build.cmd [--fresh] [--skip-tests]
+goto :fail
+
+:args_parsed
 
 if not defined VCPKG_ROOT (
     echo [error] VCPKG_ROOT must point to your vcpkg installation.
     echo         Install vcpkg and set VCPKG_ROOT before building.
     popd
     exit /b 1
+)
+
+if not exist "%VCPKG_ROOT%\scripts\buildsystems\vcpkg.cmake" (
+    echo [error] VCPKG_ROOT does not contain the vcpkg CMake toolchain.
+    goto :fail
+)
+if not exist "%VCPKG_ROOT%\.git" (
+    echo [error] This project requires a full Git checkout of vcpkg for its pinned baseline.
+    echo         Use git clone to install vcpkg, then set VCPKG_ROOT to that directory.
+    goto :fail
 )
 
 set "SRL_VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
@@ -46,13 +70,13 @@ if errorlevel 1 (
 )
 
 echo Using MSVC tools from: %SRL_MSVC_INSTALL%
-cmake --preset windows
+cmake %SRL_FRESH_CONFIGURE% --preset windows
 if errorlevel 1 goto :fail
 
 cmake --build --preset release
 if errorlevel 1 goto :fail
 
-if /I not "%~1"=="--skip-tests" (
+if not defined SRL_SKIP_TESTS (
     ctest --preset release
     if errorlevel 1 goto :fail
 )

@@ -38,12 +38,16 @@
 
 需要支持 C++20 的 MSVC 构建工具、Windows SDK 10.0.22621+、CMake 3.25+、Ninja 和 vcpkg。可以只安装 C++ Build Tools；脚本会自动检测工具链，无须安装完整的 Visual Studio IDE。
 
+vcpkg 请通过 `git clone https://github.com/microsoft/vcpkg.git` 获取完整仓库，项目需要 Git 历史来解析锁定的依赖版本。
+
 ```bat
 set VCPKG_ROOT=C:\path\to\vcpkg
 scripts\build.cmd
 ```
 
 首次构建时，vcpkg 会下载并编译所需的 FFmpeg 库；源码不包含预编译库，也无需单独安装 `ffmpeg.exe`。
+
+若切换过 vcpkg 路径或使用过其他依赖目录，运行 `scripts\build.cmd --fresh` 清除旧配置并重新构建。
 
 运行 `out\build\windows\Release\ScreenRecorderLite.exe`，并保留同目录的 FFmpeg DLL。
 
