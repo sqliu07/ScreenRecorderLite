@@ -10,12 +10,12 @@ if not exist "out\build\windows\Release\srl_probe.exe" (
     )
 )
 
-if not exist "artifacts\m0_selftest" mkdir "artifacts\m0_selftest"
-"out\build\windows\Release\srl_probe.exe" selftest --out-dir artifacts\m0_selftest > "artifacts\m0_selftest\selftest.txt" 2>&1
+if not exist "artifacts\selftest" mkdir "artifacts\selftest"
+"out\build\windows\Release\srl_probe.exe" selftest --out-dir artifacts\selftest > "artifacts\selftest\selftest.txt" 2>&1
 set RESULT=%ERRORLEVEL%
-type "artifacts\m0_selftest\selftest.txt"
+type "artifacts\selftest\selftest.txt"
 echo.
 echo Self-test exit code: %RESULT%
-echo Log: artifacts\m0_selftest\selftest.txt
+echo Log: artifacts\selftest\selftest.txt
 popd
 exit /b %RESULT%

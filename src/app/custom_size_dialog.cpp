@@ -8,7 +8,6 @@
 
 #include <cwchar>
 #include <cwctype>
-#include <format>
 #include <string>
 #include <utility>
 
@@ -79,13 +78,13 @@ void UpdatePreview(State& state) {
     int width = 0;
     int height = 0;
     if (!ParseDimension(state.widthEdit, width) || !ParseDimension(state.heightEdit, height)) {
-        ::SetWindowTextW(state.preview, ui::Text(L"实际输出：—").c_str());
-        ::SetWindowTextW(state.error, ui::Text(L"请输入 64～4096 之间的偶数宽高。").c_str());
+        ::SetWindowTextW(state.preview, ui::Text(ui::TextId::OutputSizeUnavailable).c_str());
+        ::SetWindowTextW(state.error, ui::Format(ui::TextId::CustomDimensionRange, kMinOutputDimension, kMaxOutputDimension).c_str());
         return;
     }
     if ((width % 2) != 0 || (height % 2) != 0) {
-        ::SetWindowTextW(state.preview, ui::Text(L"实际输出：—").c_str());
-        ::SetWindowTextW(state.error, ui::Text(L"宽高需为偶数。").c_str());
+        ::SetWindowTextW(state.preview, ui::Text(ui::TextId::OutputSizeUnavailable).c_str());
+        ::SetWindowTextW(state.error, ui::Text(ui::TextId::EvenDimensionsRequired).c_str());
         return;
     }
     std::wstring error;
@@ -94,12 +93,12 @@ void UpdatePreview(State& state) {
                           Size{width, height}},
         &error);
     if (!output.has_value()) {
-        ::SetWindowTextW(state.preview, ui::Text(L"实际输出：—").c_str());
-        ::SetWindowTextW(state.error, ui::Text(L"该尺寸不可用，请检查输入。").c_str());
+        ::SetWindowTextW(state.preview, ui::Text(ui::TextId::OutputSizeUnavailable).c_str());
+        ::SetWindowTextW(state.error, ui::Text(ui::TextId::CustomSizeUnavailable).c_str());
         return;
     }
-    const std::wstring text = ui::Text(
-        std::format(L"实际输出：{}×{}", output->output.width, output->output.height));
+    const std::wstring text = ui::Format(ui::TextId::OutputSizePreview,
+        output->output.width, output->output.height);
     ::SetWindowTextW(state.preview, text.c_str());
     ::SetWindowTextW(state.error, L"");
 }
@@ -119,12 +118,12 @@ void Accept(State& state) {
     int width = 0;
     int height = 0;
     if (!ParseDimension(state.widthEdit, width) || !ParseDimension(state.heightEdit, height)) {
-        ::SetWindowTextW(state.error, ui::Text(L"请输入 64～4096 之间的偶数宽高。").c_str());
+        ::SetWindowTextW(state.error, ui::Format(ui::TextId::CustomDimensionRange, kMinOutputDimension, kMaxOutputDimension).c_str());
         ::SetFocus(state.widthEdit);
         return;
     }
     if ((width % 2) != 0 || (height % 2) != 0) {
-        ::SetWindowTextW(state.error, ui::Text(L"宽高需为偶数。").c_str());
+        ::SetWindowTextW(state.error, ui::Text(ui::TextId::EvenDimensionsRequired).c_str());
         return;
     }
     std::wstring error;
@@ -133,7 +132,7 @@ void Accept(State& state) {
                                              Size{width, height}},
                            &error)
              .has_value()) {
-        ::SetWindowTextW(state.error, ui::Text(L"该尺寸不可用，请检查输入。").c_str());
+        ::SetWindowTextW(state.error, ui::Text(ui::TextId::CustomSizeUnavailable).c_str());
         return;
     }
     state.result = Size{width, height};
@@ -183,11 +182,11 @@ LRESULT CALLBACK DialogProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
             const int margin = Scale(dpi, 20);
             HWND hint = ::CreateWindowExW(
                 0, L"STATIC",
-                ui::Text(L"输入上限宽高，画面保持原始比例且不会放大。").c_str(),
+                ui::Text(ui::TextId::CustomSizeHint).c_str(),
                 WS_CHILD | WS_VISIBLE | SS_LEFT, margin, margin,
                 Scale(dpi, 380), Scale(dpi, 22), window, nullptr, nullptr, nullptr);
             HWND widthLabel = ::CreateWindowExW(
-                0, L"STATIC", ui::Text(L"宽度").c_str(), WS_CHILD | WS_VISIBLE | SS_LEFT, margin,
+                0, L"STATIC", ui::Text(ui::TextId::Width).c_str(), WS_CHILD | WS_VISIBLE | SS_LEFT, margin,
                 margin + Scale(dpi, 56) + Scale(dpi, 4), Scale(dpi, 40),
                 Scale(dpi, 24), window, nullptr, nullptr, nullptr);
             state->widthEdit = ::CreateWindowExW(
@@ -195,7 +194,7 @@ LRESULT CALLBACK DialogProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
                     ES_AUTOHSCROLL | WS_TABSTOP,
                 0, 0, 0, 0, window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kIdWidth)), nullptr, nullptr);
             HWND heightLabel = ::CreateWindowExW(
-                0, L"STATIC", ui::Text(L"高度").c_str(), WS_CHILD | WS_VISIBLE | SS_LEFT, margin,
+                0, L"STATIC", ui::Text(ui::TextId::Height).c_str(), WS_CHILD | WS_VISIBLE | SS_LEFT, margin,
                 margin + Scale(dpi, 56) + Scale(dpi, 30) + Scale(dpi, 12) +
                     Scale(dpi, 4),
                 Scale(dpi, 40), Scale(dpi, 24), window, nullptr, nullptr, nullptr);
@@ -204,16 +203,16 @@ LRESULT CALLBACK DialogProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
                     ES_AUTOHSCROLL | WS_TABSTOP,
                 0, 0, 0, 0, window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kIdHeight)), nullptr, nullptr);
             state->preview = ::CreateWindowExW(
-                0, L"STATIC", ui::Text(L"实际输出：—").c_str(), WS_CHILD | WS_VISIBLE | SS_LEFT, 0, 0, 0,
+                0, L"STATIC", ui::Text(ui::TextId::OutputSizeUnavailable).c_str(), WS_CHILD | WS_VISIBLE | SS_LEFT, 0, 0, 0,
                 0, window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kIdPreview)), nullptr, nullptr);
             state->error = ::CreateWindowExW(
                 0, L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_LEFT, 0, 0, 0, 0, window,
                 reinterpret_cast<HMENU>(static_cast<INT_PTR>(kIdError)), nullptr, nullptr);
             HWND cancel = ::CreateWindowExW(
-                0, L"BUTTON", ui::Text(L"取消").c_str(), WS_CHILD | WS_VISIBLE | BS_OWNERDRAW | WS_TABSTOP,
+                0, L"BUTTON", ui::Text(ui::TextId::Cancel).c_str(), WS_CHILD | WS_VISIBLE | BS_OWNERDRAW | WS_TABSTOP,
                 0, 0, 0, 0, window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kIdCancel)), nullptr, nullptr);
             HWND ok = ::CreateWindowExW(
-                0, L"BUTTON", ui::Text(L"保存").c_str(), WS_CHILD | WS_VISIBLE | BS_OWNERDRAW | WS_TABSTOP,
+                0, L"BUTTON", ui::Text(ui::TextId::Save).c_str(), WS_CHILD | WS_VISIBLE | BS_OWNERDRAW | WS_TABSTOP,
                 0, 0, 0, 0, window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kIdOk)),
                 nullptr, nullptr);
             for (HWND control : {hint, widthLabel, state->widthEdit, heightLabel,
@@ -341,7 +340,7 @@ bool CustomSizeDialog::Show(HWND owner, HINSTANCE instance, int sourceWidth,
     ::EnableWindow(owner, FALSE);
     state.window = ::CreateWindowExW(
         WS_EX_DLGMODALFRAME | WS_EX_CONTROLPARENT, kDialogClass,
-        ui::Text(L"自定义分辨率").c_str(),
+        ui::Text(ui::TextId::CustomResolutionTitle).c_str(),
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, x, y, width, height, owner, nullptr,
         instance, &state);
     if (state.window == nullptr) {

@@ -2,6 +2,12 @@
 
 #include <winrt/base.h>
 
+extern "C" {
+#include <libavformat/avformat.h>
+#include <libavcodec/avcodec.h>
+#include <libavutil/avutil.h>
+}
+
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
@@ -22,6 +28,7 @@
 #include "capture/exclusion_probe.h"
 #include "capture/wgc_probe.h"
 #include "common/win32.h"
+#include "core/output_format.h"
 #include "image/png_probe.h"
 #include "media/codec_probe.h"
 #include "media/mf_util.h"
@@ -42,6 +49,42 @@ using srl::ConsoleLine;
 using srl::HResultError;
 using srl::Utf8ToWide;
 using srl::WideToUtf8;
+
+std::string JsonString(std::string_view value) {
+    std::string result = "\"";
+    for (const unsigned char c : value) {
+        switch (c) {
+            case '"': result += "\\\""; break;
+            case '\\': result += "\\\\"; break;
+            case '\n': result += "\\n"; break;
+            case '\r': result += "\\r"; break;
+            case '\t': result += "\\t"; break;
+            default:
+                if (c < 0x20) result += std::format("\\u{:04x}", c);
+                else result += static_cast<char>(c);
+        }
+    }
+    return result + '"';
+}
+
+void PrintDependencyInfo() {
+    struct Library { const char* name; unsigned version; const char* license; const char* configuration; };
+    const Library libraries[] = {
+        {"avformat", avformat_version(), avformat_license(), avformat_configuration()},
+        {"avcodec", avcodec_version(), avcodec_license(), avcodec_configuration()},
+        {"avutil", avutil_version(), avutil_license(), avutil_configuration()},
+    };
+    std::string json = "{\"libraries\":[";
+    for (const auto& library : libraries) {
+        if (&library != libraries) json += ',';
+        const auto version = std::format("{}.{}.{}", AV_VERSION_MAJOR(library.version),
+            AV_VERSION_MINOR(library.version), AV_VERSION_MICRO(library.version));
+        json += "{\"name\":" + JsonString(library.name) + ",\"version\":" + JsonString(version) +
+            ",\"license\":" + JsonString(library.license) +
+            ",\"configuration\":" + JsonString(library.configuration) + '}';
+    }
+    ConsoleLine(json + "]}");
+}
 
 enum class Command {
     Info,
@@ -119,7 +162,6 @@ public:
             valid = false;
             return fallback;
         }
-        valid = true;
         return static_cast<int>(parsed);
     }
 
@@ -130,8 +172,8 @@ public:
             L"--width", L"--height", L"--fps", L"--bitrate-mbps", L"--seconds",
             L"--out", L"--out-dir", L"--monitor", L"--timeout-ms", L"--duration-ms",
             L"--no-audio", L"--software", L"--check-loopback", L"--check-mic",
-            L"--allow-advanced-color", L"--verify", L"--desktop", L"--pattern",
-            L"--tone", L"--audio", L"--mic", L"--limit",
+            L"--verify", L"--desktop", L"--pattern",
+            L"--tone", L"--audio", L"--mic", L"--limit", L"--format",
         };
         for (const auto& [key, value] : options_) {
             (void)value;
@@ -154,7 +196,7 @@ private:
 };
 
 void PrintHelp() {
-    ConsoleLine("ScreenRecorderLite M0 technical-feasibility probe " SRL_VERSION);
+    ConsoleLine("ScreenRecorderLite diagnostics " SRL_VERSION);
     ConsoleLine();
     ConsoleLine("Usage: srl_probe <command> [options]");
     ConsoleLine();
@@ -172,7 +214,7 @@ void PrintHelp() {
     ConsoleLine("  png        Save and decode a synthetic BGRA image through WIC.");
     ConsoleLine("             Options: --out --width --height");
     ConsoleLine("  capture    Capture one frame from a monitor through Windows Graphics Capture.");
-    ConsoleLine("             Options: --monitor --out --timeout-ms --allow-advanced-color");
+    ConsoleLine("             Options: --monitor --out --timeout-ms");
     ConsoleLine("             WARNING: reads the desktop; never invoked by selftest.");
     ConsoleLine("  exclude    Apply WDA_EXCLUDEFROMCAPTURE to a short-lived topmost window.");
     ConsoleLine("             Options: --monitor --duration-ms --verify (captures one frame");
@@ -183,16 +225,16 @@ void PrintHelp() {
     ConsoleLine("             Default: shows an animated test-pattern window and records only");
     ConsoleLine("             that region (safe automated test). Options: --desktop records");
     ConsoleLine("             the selected monitor instead; --seconds --monitor --limit");
-    ConsoleLine("             --fps --bitrate-mbps --out-dir --no-audio --audio --tone");
+    ConsoleLine("             --format mp4|gif --fps --bitrate-mbps --out-dir --no-audio --audio --tone");
     ConsoleLine("  selftest   Run the non-capturing checks (info, codec, audio loopback readiness,");
     ConsoleLine("             hardware+software mux, PNG) and write artifacts to --out-dir.");
     ConsoleLine();
-    ConsoleLine("Artifacts default to artifacts/m0_<timestamp>.");
+    ConsoleLine("Artifacts default to artifacts/diagnostics_<timestamp>.");
 }
 
 std::filesystem::path DefaultArtifactDirectory() {
     return std::filesystem::path(L"artifacts") /
-           (L"m0_" + srl::CurrentTimestampForFileName());
+           (L"diagnostics_" + srl::CurrentTimestampForFileName());
 }
 
 bool PrepareDirectory(const std::filesystem::path& directory) {
@@ -280,7 +322,6 @@ int RunCapture(const Arguments& arguments) {
     srl::WgcProbeOptions options;
     options.monitorIndex = arguments.intValue(L"--monitor", 0, 0, 64, valid);
     options.timeoutMs = arguments.intValue(L"--timeout-ms", 3000, 100, 20000, valid);
-    options.allowAdvancedColor = arguments.has(L"--allow-advanced-color");
     if (const auto out = arguments.value(L"--out"); out.has_value()) {
         options.savePng = true;
         options.pngPath = *out;
@@ -323,22 +364,31 @@ std::optional<srl::ResolutionLimit> ParseResolutionLimit(std::wstring_view text)
 }
 
 int RunRecord(const Arguments& arguments) {
+    const std::wstring formatName = arguments.value(L"--format").value_or(L"mp4");
+    if (formatName != L"mp4" && formatName != L"gif") {
+        ConsoleLine("error: --format must be mp4 or gif");
+        return 2;
+    }
+    const auto format = formatName == L"gif" ? srl::RecordingFormat::Gif : srl::RecordingFormat::Mp4;
     bool valid = true;
     const int seconds = arguments.intValue(L"--seconds", 3, 1, 120, valid);
     const int monitorIndex = arguments.intValue(L"--monitor", 0, 0, 64, valid);
-    const int fps = arguments.intValue(L"--fps", 30, 30, 60, valid);
+    const int defaultFps = format == srl::RecordingFormat::Gif
+        ? srl::kDefaultGifFrameRate : srl::kDefaultMp4FrameRate;
+    const int fps = arguments.intValue(L"--fps", defaultFps, 1, 60, valid);
     const int bitrate = arguments.intValue(L"--bitrate-mbps", 8, 1, 50, valid);
     const bool desktop = arguments.has(L"--desktop");
     const bool patternFlag = arguments.has(L"--pattern");
     const bool tone = arguments.has(L"--tone");
-    const bool audioEnabled = arguments.has(L"--audio") || tone;
-    const bool microphoneEnabled = arguments.has(L"--mic");
+    const bool audioEnabled = format == srl::RecordingFormat::Mp4 && (arguments.has(L"--audio") || tone);
+    const bool microphoneEnabled = format == srl::RecordingFormat::Mp4 && arguments.has(L"--mic");
     if (!valid) {
         ConsoleLine("error: invalid numeric option");
         return 2;
     }
-    if (fps != 30 && fps != 60) {
-        ConsoleLine("error: --fps must be 30 or 60");
+    if (!srl::IsFrameRateSupported(format, fps)) {
+        ConsoleLine(format == srl::RecordingFormat::Gif
+            ? "error: GIF --fps must be 10, 15, 20 or 25" : "error: MP4 --fps must be 30 or 60");
         return 2;
     }
     if (desktop && patternFlag) {
@@ -409,6 +459,7 @@ int RunRecord(const Arguments& arguments) {
     }
 
     srl::RecordingConfig config;
+    config.format = format;
     config.monitor = monitor->handle;
     config.monitorDeviceName = monitor->deviceName;
     config.sourceRect = sourceRect;
@@ -420,7 +471,7 @@ int RunRecord(const Arguments& arguments) {
     config.outputDirectory = outputDirectory.wstring();
 
     probe::TestTone testTone;
-    if (tone) {
+    if (tone && format == srl::RecordingFormat::Mp4) {
         std::wstring toneError;
         if (!testTone.Start(seconds + 3, &toneError)) {
             ConsoleLine(std::format("error: {}", srl::WideToUtf8(toneError)));
@@ -522,6 +573,9 @@ int RunRecord(const Arguments& arguments) {
     if (!result.partialPath.empty()) {
         ConsoleLine(std::format("partial file:       {}",
                                 srl::WideToUtf8(result.partialPath)));
+    }
+    for (const auto& path : result.recoveryPaths) {
+        ConsoleLine(std::format("recovery audio:     {}", srl::WideToUtf8(path)));
     }
     if (!result.error.empty()) {
         ConsoleLine(std::format("error:              {}", srl::WideToUtf8(result.error)));
@@ -654,6 +708,12 @@ int wmain(int argc, wchar_t** argv) {
     ::SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     std::setvbuf(stdout, nullptr, _IONBF, 0);
 
+    // Packaging must be able to inspect dependency licensing on headless runners.
+    if (argc == 2 && std::wstring_view(argv[1]) == L"--dependency-info") {
+        PrintDependencyInfo();
+        return 0;
+    }
+
     bool apartmentInitialized = false;
     try {
         winrt::init_apartment(winrt::apartment_type::multi_threaded);
@@ -695,7 +755,7 @@ int wmain(int argc, wchar_t** argv) {
                 ConsoleLine("error: unknown option");
                 exitCode = 2;
             } else {
-                ConsoleLine(std::format("ScreenRecorderLite M0 probe {}", SRL_VERSION));
+                ConsoleLine(std::format("ScreenRecorderLite diagnostics {}", SRL_VERSION));
                 ConsoleLine();
                 switch (command) {
                     case Command::Info:

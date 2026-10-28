@@ -25,6 +25,13 @@ struct MonitorInfo {
     bool advancedColorSupported = false;
     bool advancedColorEnabled = false;
     bool wideColorEnforced = false;
+    bool hdrEnabled = false;
+    bool hdrStateKnown = false;
+    bool colorInfoAvailable = false;
+    float sdrWhiteScale = 1.0f;  // scRGB linear SDR white / 80 nits
+    LUID targetAdapterId{};
+    UINT32 targetId = 0;
+    bool hasDisplayConfigTarget = false;
     std::uint32_t bitsPerColorChannel = 0;
     std::wstring colorEncoding;
     std::wstring outputTechnology;
@@ -33,6 +40,9 @@ struct MonitorInfo {
 [[nodiscard]] std::vector<MonitorInfo> EnumerateDisplays();
 [[nodiscard]] const MonitorInfo* PrimaryMonitor(const std::vector<MonitorInfo>& displays);
 [[nodiscard]] bool IsAdvancedColorActive(const MonitorInfo& monitor);
+[[nodiscard]] bool IsHdrActive(const MonitorInfo& monitor);
+// Updates this target only; other monitors' HDR state never participates.
+[[nodiscard]] bool RefreshDisplayColor(MonitorInfo& monitor);
 void PrintDisplays(const std::vector<MonitorInfo>& displays);
 
 }  // namespace srl

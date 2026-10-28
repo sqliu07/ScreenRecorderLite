@@ -9,6 +9,7 @@
 #include <string>
 
 #include "platform/displays.h"
+#include "app/ui_text.h"
 
 namespace srl {
 
@@ -27,9 +28,11 @@ public:
                 std::wstring* error);
     void Destroy();
 
-    void SetContent(std::wstring_view status, bool showAction, std::wstring_view actionText);
+    void SetContent(std::wstring_view status, bool showAction, ui::TextId action);
+    void SetContent(ui::TextId status, bool showAction, ui::TextId action);
     void SetRecordingControls(bool recording, bool audioPending,
-                              bool systemEnabled, bool micEnabled);
+                              bool systemEnabled, bool micEnabled,
+                              bool audioSupported = true);
     void SetMicrophoneLevel(float level);
     void SetPosition(const MonitorInfo& monitor, const RECT* avoidScreenRect);
     void Show();
@@ -45,7 +48,7 @@ private:
     void OnPaint();
     void UpdateFonts();
     void RecreateFonts();
-    void SetToolTip(HWND control, const wchar_t* text);
+    void SetToolTip(HWND control, ui::TextId text);
     void SetRegionOutline(const RECT* screenRect);
     void SetRegionOutlineVisible(bool visible);
     void DestroyRegionOutline();
@@ -73,9 +76,11 @@ private:
     UINT dpi_ = 96;
     bool actionVisible_ = false;
     std::wstring actionText_;
+    ui::TextId actionId_ = ui::TextId::Empty;
     std::wstring statusText_;
     bool recording_ = false;
     bool audioPending_ = false;
+    bool audioSupported_ = true;
     bool systemEnabled_ = false;
     bool micEnabled_ = false;
     bool meterTimerRunning_ = false;

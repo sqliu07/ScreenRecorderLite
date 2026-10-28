@@ -13,7 +13,6 @@ struct WgcProbeOptions {
     int timeoutMs = 3000;
     bool savePng = false;
     std::wstring pngPath;
-    bool allowAdvancedColor = false;
     // Monitor-relative physical pixel positions. Empty means the frame center.
     std::vector<POINT> samplePoints;
 };

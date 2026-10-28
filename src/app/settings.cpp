@@ -66,11 +66,19 @@ bool LoadAppSettings(AppSettings& settings) {
     const int regionBottom = ReadInt(L"region_bottom", 0);
 
     settings.monitorDeviceName = monitor;
+    settings.format = ReadInt(L"format", 0) == 1 ? RecordingFormat::Gif : RecordingFormat::Mp4;
     settings.limit = static_cast<ResolutionLimit>(limit);
     settings.customBound = Size{
         std::clamp(customWidth, kMinOutputDimension, kMaxOutputDimension),
         std::clamp(customHeight, kMinOutputDimension, kMaxOutputDimension)};
-    settings.fps = fps == 60 ? 60 : 30;
+    settings.fps = IsFrameRateSupported(RecordingFormat::Mp4, fps) ? fps : kDefaultMp4FrameRate;
+    const int gifFps = ReadInt(L"gif_fps", kDefaultGifFrameRate);
+    settings.gifFps = IsFrameRateSupported(RecordingFormat::Gif, gifFps) ? gifFps : kDefaultGifFrameRate;
+    settings.gifLimit = static_cast<ResolutionLimit>(std::clamp(
+        ReadInt(L"gif_limit", static_cast<int>(ResolutionLimit::P720)), 0, 5));
+    settings.gifCustomBound = Size{
+        std::clamp(ReadInt(L"gif_custom_width", 1280), kMinOutputDimension, kMaxOutputDimension),
+        std::clamp(ReadInt(L"gif_custom_height", 720), kMinOutputDimension, kMaxOutputDimension)};
     settings.bitrateMbps = std::clamp(bitrate, 1, 50);
     settings.systemAudio = ReadInt(L"system_audio", 1) != 0;
     settings.microphone = ReadInt(L"microphone", 0) != 0;
@@ -78,8 +86,8 @@ bool LoadAppSettings(AppSettings& settings) {
     settings.microphoneDeviceId = ReadString(L"microphone_device", L"");
     settings.outputDirectory = ReadString(L"output_directory", L"");
     settings.uiLanguage = std::clamp(ReadInt(L"ui_language", 0), 0, 2);
-    settings.hasRegion = regionRight - regionLeft >= 64 &&
-                         regionBottom - regionTop >= 64;
+    settings.hasRegion = regionRight - regionLeft >= kMinOutputDimension &&
+                         regionBottom - regionTop >= kMinOutputDimension;
     if (settings.hasRegion) {
         settings.region = RECT{regionLeft, regionTop, regionRight, regionBottom};
     }
@@ -96,8 +104,13 @@ bool SaveAppSettings(const AppSettings& settings) {
     }
     bool ok = true;
     ok = WriteString(L"monitor", settings.monitorDeviceName) && ok;
+    ok = WriteInt(L"format", static_cast<int>(settings.format)) && ok;
     ok = WriteInt(L"limit", static_cast<int>(settings.limit)) && ok;
     ok = WriteInt(L"fps", settings.fps) && ok;
+    ok = WriteInt(L"gif_limit", static_cast<int>(settings.gifLimit)) && ok;
+    ok = WriteInt(L"gif_custom_width", settings.gifCustomBound.width) && ok;
+    ok = WriteInt(L"gif_custom_height", settings.gifCustomBound.height) && ok;
+    ok = WriteInt(L"gif_fps", settings.gifFps) && ok;
     ok = WriteInt(L"bitrate", settings.bitrateMbps) && ok;
     ok = WriteInt(L"custom_width", settings.customBound.width) && ok;
     ok = WriteInt(L"custom_height", settings.customBound.height) && ok;

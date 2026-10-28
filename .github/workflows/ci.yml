@@ -48,7 +48,7 @@ jobs:
         run: call scripts\build.cmd --skip-tests
       - name: Run CTest suite
         run: ctest --preset release --output-on-failure
-      - name: Package portable app and FFmpeg source
+      - name: Package app, FFmpeg DLLs and corresponding source
         shell: pwsh
         run: ./scripts/package-release.ps1 -OutputDirectory "$env:RUNNER_TEMP/release-assets"
       - name: Upload build artifacts

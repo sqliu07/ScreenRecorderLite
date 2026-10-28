@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "common/win32.h"
+#include "core/recording_format.h"
 #include "media/mf_util.h"
 
 namespace srl {
@@ -25,12 +26,10 @@ namespace {
 
 using Microsoft::WRL::ComPtr;
 
-constexpr std::int64_t kSecondsTo100Ns = 10'000'000;
-constexpr std::uint32_t kAudioSampleRate = 48'000;
-constexpr std::uint32_t kAudioChannels = 2;
-constexpr std::uint32_t kAudioBytesPerSample = 2;
-constexpr std::uint32_t kAudioChunkFrames = 480;  // 10 ms
-constexpr std::int64_t kAudioChunkDuration = 100'000;
+constexpr std::uint32_t kAudioChunkMilliseconds = 10;
+constexpr std::uint32_t kAudioChunkFrames = kAudioOutputRate * kAudioChunkMilliseconds / 1'000;
+constexpr std::int64_t kAudioChunkDuration =
+    kAudioChunkMilliseconds * kHundredNanosecondsPerMillisecond;
 
 std::wstring HrTextWide(HRESULT hr) {
     return Utf8ToWide(HResultText(hr));
@@ -87,10 +86,10 @@ ComPtr<IMFMediaType> CreateAudioTargetType() {
     }
     type->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
     type->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_AAC);
-    type->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, kAudioSampleRate);
-    type->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, kAudioChannels);
-    type->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, 16);
-    type->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, 16'000);
+    type->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, kAudioOutputRate);
+    type->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, kAudioOutputChannels);
+    type->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, kAudioPcmBitsPerSample);
+    type->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, kAudioEncodedBytesPerSecond);
     type->SetUINT32(MF_MT_AAC_PAYLOAD_TYPE, 0);
     type->SetUINT32(MF_MT_AAC_AUDIO_PROFILE_LEVEL_INDICATION, 0x29);
     return type;
@@ -103,13 +102,13 @@ ComPtr<IMFMediaType> CreateAudioInputType() {
     }
     type->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
     type->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_PCM);
-    type->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, kAudioSampleRate);
-    type->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, kAudioChannels);
-    type->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, 16);
+    type->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, kAudioOutputRate);
+    type->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, kAudioOutputChannels);
+    type->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, kAudioPcmBitsPerSample);
     type->SetUINT32(MF_MT_AUDIO_BLOCK_ALIGNMENT,
-                    kAudioChannels * kAudioBytesPerSample);
+                    kAudioOutputChannels * kAudioPcmBytesPerSample);
     type->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND,
-                    kAudioSampleRate * kAudioChannels * kAudioBytesPerSample);
+                    kAudioOutputRate * kAudioOutputChannels * kAudioPcmBytesPerSample);
     return type;
 }
 
@@ -180,7 +179,7 @@ void FillPcmChunk(std::vector<std::uint8_t>& chunk, std::uint32_t chunkIndex) {
     const std::uint32_t frames = kAudioChunkFrames;
     for (std::uint32_t i = 0; i < frames; ++i) {
         const double time =
-            static_cast<double>(chunkIndex * frames + i) / kAudioSampleRate;
+            static_cast<double>(chunkIndex * frames + i) / kAudioOutputRate;
         const auto value = static_cast<std::int16_t>(
             std::sin(2.0 * 3.14159265358979323846 * 440.0 * time) * 0.2 * 32767.0);
         samples[i * 2] = value;
@@ -314,23 +313,23 @@ bool ValidateFile(MuxProbeResult& result, const MuxProbeOptions& options) {
 
     PROPVARIANT duration{};
     ::PropVariantInit(&duration);
-    if (SUCCEEDED(reader->GetPresentationAttribute(MF_SOURCE_READER_MEDIASOURCE,
+    if (SUCCEEDED(reader->GetPresentationAttribute(static_cast<DWORD>(MF_SOURCE_READER_MEDIASOURCE),
                                                     MF_PD_DURATION, &duration)) &&
         duration.vt == VT_UI8) {
         result.containerDurationSeconds =
-            static_cast<double>(duration.uhVal.QuadPart) / kSecondsTo100Ns;
+            static_cast<double>(duration.uhVal.QuadPart) / kHundredNanosecondsPerSecond;
     }
     ::PropVariantClear(&duration);
 
-    reader->SetStreamSelection(MF_SOURCE_READER_ALL_STREAMS, FALSE);
+    reader->SetStreamSelection(static_cast<DWORD>(MF_SOURCE_READER_ALL_STREAMS), FALSE);
 
-    hr = reader->SetStreamSelection(MF_SOURCE_READER_FIRST_VIDEO_STREAM, TRUE);
+    hr = reader->SetStreamSelection(static_cast<DWORD>(MF_SOURCE_READER_FIRST_VIDEO_STREAM), TRUE);
     if (FAILED(hr)) {
         result.validationError = L"no video stream in the produced MP4";
         return false;
     }
     ComPtr<IMFMediaType> nativeVideo;
-    if (SUCCEEDED(reader->GetNativeMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM, 0,
+    if (SUCCEEDED(reader->GetNativeMediaType(static_cast<DWORD>(MF_SOURCE_READER_FIRST_VIDEO_STREAM), 0,
                                               nativeVideo.GetAddressOf()))) {
         result.actualVideoType = MediaTypeSummary(nativeVideo.Get());
     }
@@ -340,7 +339,7 @@ bool ValidateFile(MuxProbeResult& result, const MuxProbeOptions& options) {
         DWORD flags = 0;
         LONGLONG timestamp = 0;
         ComPtr<IMFSample> sample;
-        hr = reader->ReadSample(MF_SOURCE_READER_FIRST_VIDEO_STREAM, 0, &actualStream, &flags,
+        hr = reader->ReadSample(static_cast<DWORD>(MF_SOURCE_READER_FIRST_VIDEO_STREAM), 0, &actualStream, &flags,
                                 &timestamp, sample.GetAddressOf());
         if (FAILED(hr)) {
             result.validationError = Utf8ToWide(
@@ -357,7 +356,7 @@ bool ValidateFile(MuxProbeResult& result, const MuxProbeOptions& options) {
             ++result.videoSamplesRead;
             result.lastVideoTimestampSeconds = std::max(
                 result.lastVideoTimestampSeconds,
-                static_cast<double>(timestamp) / kSecondsTo100Ns);
+                static_cast<double>(timestamp) / kHundredNanosecondsPerSecond);
         }
     }
 
@@ -373,14 +372,14 @@ bool ValidateFile(MuxProbeResult& result, const MuxProbeOptions& options) {
                 "audio source reader creation failed: {}", HResultText(hr)));
             return false;
         }
-        reader->SetStreamSelection(MF_SOURCE_READER_ALL_STREAMS, FALSE);
-        hr = reader->SetStreamSelection(MF_SOURCE_READER_FIRST_AUDIO_STREAM, TRUE);
+        reader->SetStreamSelection(static_cast<DWORD>(MF_SOURCE_READER_ALL_STREAMS), FALSE);
+        hr = reader->SetStreamSelection(static_cast<DWORD>(MF_SOURCE_READER_FIRST_AUDIO_STREAM), TRUE);
         if (FAILED(hr)) {
             result.validationError = L"no audio stream in the produced MP4";
             return false;
         }
         ComPtr<IMFMediaType> nativeAudio;
-        if (SUCCEEDED(reader->GetNativeMediaType(MF_SOURCE_READER_FIRST_AUDIO_STREAM, 0,
+        if (SUCCEEDED(reader->GetNativeMediaType(static_cast<DWORD>(MF_SOURCE_READER_FIRST_AUDIO_STREAM), 0,
                                                   nativeAudio.GetAddressOf()))) {
             result.actualAudioType = MediaTypeSummary(nativeAudio.Get());
         }
@@ -389,7 +388,7 @@ bool ValidateFile(MuxProbeResult& result, const MuxProbeOptions& options) {
             DWORD flags = 0;
             LONGLONG timestamp = 0;
             ComPtr<IMFSample> sample;
-            hr = reader->ReadSample(MF_SOURCE_READER_FIRST_AUDIO_STREAM, 0, &actualStream,
+            hr = reader->ReadSample(static_cast<DWORD>(MF_SOURCE_READER_FIRST_AUDIO_STREAM), 0, &actualStream,
                                     &flags, &timestamp, sample.GetAddressOf());
             if (FAILED(hr)) {
                 result.validationError = Utf8ToWide(
@@ -406,7 +405,7 @@ bool ValidateFile(MuxProbeResult& result, const MuxProbeOptions& options) {
                 ++result.audioSamplesRead;
                 result.lastAudioTimestampSeconds = std::max(
                     result.lastAudioTimestampSeconds,
-                    static_cast<double>(timestamp) / kSecondsTo100Ns);
+                    static_cast<double>(timestamp) / kHundredNanosecondsPerSecond);
             }
         }
     }
@@ -553,12 +552,12 @@ MuxProbeResult RunMuxProbe(const MuxProbeOptions& options) {
     const int height = options.height;
     const std::size_t frameBytes = static_cast<std::size_t>(width) * height * 3 / 2;
     std::vector<std::uint8_t> frame(frameBytes);
-    const LONGLONG videoDuration = kSecondsTo100Ns / options.fps;
+    const LONGLONG videoDuration = kHundredNanosecondsPerSecond / options.fps;
     const int totalFrames = options.seconds * options.fps;
     const int totalAudioChunks =
         options.includeAudio ? options.seconds * 1000 / 10 : 0;
-    std::vector<std::uint8_t> audioChunk(kAudioChunkFrames * kAudioChannels *
-                                         kAudioBytesPerSample);
+    std::vector<std::uint8_t> audioChunk(kAudioChunkFrames * kAudioOutputChannels *
+                                         kAudioPcmBytesPerSample);
 
     int audioChunksWritten = 0;
     for (int frameIndex = 0; frameIndex < totalFrames; ++frameIndex) {

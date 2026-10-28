@@ -1,0 +1,8 @@
+{
+  "triplet": "@VCPKG_TARGET_TRIPLET@",
+  "installedRoot": "@SRL_DEPENDENCY_INSTALLED_ROOT@",
+  "vcpkgRoot": "@SRL_DEPENDENCY_VCPKG_ROOT@",
+  "runtimeFiles": [
+    "@SRL_DEPENDENCY_RUNTIME_JSON@"
+  ]
+}

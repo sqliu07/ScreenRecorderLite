@@ -15,6 +15,7 @@
 #include <iterator>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -30,6 +31,7 @@
 #include "audio/audio_probe.h"
 #include "common/win32.h"
 #include "core/output_size.h"
+#include "core/recording_format.h"
 #include "core/storage.h"
 #include "platform/displays.h"
 #include "recording/recorder.h"
@@ -74,6 +76,8 @@ enum ControlId : int {
     kLabelOutput,
     kLanguageLabel,
     kLanguageCombo,
+    kFormatLabel,
+    kFormatCombo,
 };
 
 constexpr wchar_t kMainClass[] = L"ScreenRecorderLite.MainWindow";
@@ -98,18 +102,28 @@ constexpr COLORREF kColorSeparator = RGB(234, 237, 241);
 constexpr COLORREF kColorError = RGB(184, 38, 32);
 
 struct QualityOption {
-    const wchar_t* name;
+    ui::TextId name;
     int bitrateMbps;
 };
 
 constexpr QualityOption kQualityOptions[] = {
-    {L"极高", 20},
-    {L"高", 12},
-    {L"中", 8},
-    {L"低", 4},
+    {ui::TextId::QualityVeryHigh, 20},
+    {ui::TextId::QualityHigh, 12},
+    {ui::TextId::QualityMedium, 8},
+    {ui::TextId::QualityLow, 4},
 };
 constexpr int kQualityCount = static_cast<int>(std::size(kQualityOptions));
 constexpr int kDefaultQualityIndex = 2;
+constexpr ui::TextId kResolutionChoices[] = {
+    ui::TextId::OriginalSize, ui::TextId::Resolution720p, ui::TextId::Resolution1080p,
+    ui::TextId::Resolution1440p, ui::TextId::Resolution2160p, ui::TextId::CustomSize,
+};
+constexpr UINT kUiRefreshIntervalMs = 200;
+constexpr std::uint32_t kEstimateDurationSeconds = 60;
+constexpr auto kCountdownDuration = std::chrono::seconds(3);
+constexpr auto kTransientMessageDuration = std::chrono::seconds(3);
+constexpr auto kSavingProgressDelay = std::chrono::seconds(10);
+constexpr std::size_t kMaxPendingScreenshots = 2;
 
 int Scale(UINT dpi, int value) {
     return MulDiv(value, static_cast<int>(dpi), 96);
@@ -121,11 +135,11 @@ int FontHeight(UINT dpi, int points) {
 
 std::wstring FormatDuration(std::int64_t hundredNanoseconds) {
     const std::int64_t totalSeconds =
-        std::max<std::int64_t>(0, hundredNanoseconds) / 10'000'000;
+        std::max<std::int64_t>(0, hundredNanoseconds) / kHundredNanosecondsPerSecond;
     const std::int64_t hours = totalSeconds / 3600;
     const std::int64_t minutes = (totalSeconds / 60) % 60;
     const std::int64_t seconds = totalSeconds % 60;
-    return Utf8ToWide(std::format("{:02}:{:02}:{:02}", hours, minutes, seconds));
+    return std::format(L"{:02}:{:02}:{:02}", hours, minutes, seconds);
 }
 
 std::wstring Trim(std::wstring value) {
@@ -164,7 +178,7 @@ bool PickFolder(HWND owner, std::wstring& selected) {
         dialog->SetOptions(options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM |
                            FOS_PATHMUSTEXIST);
     }
-    const std::wstring title = ui::Text(L"选择导出目录");
+    const std::wstring title = ui::Text(ui::TextId::SelectExportFolder);
     dialog->SetTitle(title.c_str());
     if (FAILED(dialog->Show(owner))) {
         return false;
@@ -194,11 +208,15 @@ bool HighContrast() {
            (hc.dwFlags & HCF_HIGHCONTRASTON) != 0;
 }
 
-int MessageBoxUi(HWND owner, std::wstring_view message, std::wstring_view title,
+int MessageBoxUi(HWND owner, std::wstring_view message, ui::TextId title,
                  UINT flags) {
-    const std::wstring localizedMessage = ui::Text(message);
+    const std::wstring localizedMessage = ui::LocalizeMessage(message);
     const std::wstring localizedTitle = ui::Text(title);
     return ::MessageBoxW(owner, localizedMessage.c_str(), localizedTitle.c_str(), flags);
+}
+
+int MessageBoxUi(HWND owner, ui::TextId message, ui::TextId title, UINT flags) {
+    return MessageBoxUi(owner, ui::Text(message), title, flags);
 }
 
 void ThemeControl(HWND control) {
@@ -253,7 +271,7 @@ public:
         ui::InitializeLanguage(startupSettings.uiLanguage);
         const HRESULT comResult = ::CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
         if (FAILED(comResult)) {
-            MessageBoxUi(nullptr, L"无法初始化 COM，程序无法启动。", L"轻录",
+            MessageBoxUi(nullptr, ui::TextId::ComInitializationFailed, ui::TextId::AppName,
                           MB_ICONERROR | MB_OK);
             return 1;
         }
@@ -318,7 +336,7 @@ private:
         }
 
         const DWORD style = WS_OVERLAPPEDWINDOW & ~WS_MAXIMIZEBOX;
-        const std::wstring windowTitle = ui::Text(L"轻录");
+        const std::wstring windowTitle = ui::Text(ui::TextId::AppName);
         window_ = ::CreateWindowExW(0, kMainClass, windowTitle.c_str(), style, CW_USEDEFAULT,
                                     CW_USEDEFAULT, 420, 420, nullptr, nullptr, instance_,
                                     nullptr);
@@ -379,7 +397,7 @@ private:
         UpdateUiState();
         Layout();
 
-        ::SetTimer(window_, kUiTimerId, 200, nullptr);
+        ::SetTimer(window_, kUiTimerId, kUiRefreshIntervalMs, nullptr);
         hotkeyStartStop_ =
             ::RegisterHotKey(window_, kHotkeyStartStop, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT,
                              VK_F9) != FALSE;
@@ -391,9 +409,9 @@ private:
                              VK_F11) != FALSE;
         UpdateDerivedState(true);
         if (!hotkeyScreenshot_) {
-            SetStatus(L"截图快捷键 Ctrl+Alt+F10 不可用；仍可使用截图按钮。");
+            SetStatus(ui::TextId::ScreenshotHotkeyUnavailable);
         } else if (!hotkeyStartStop_) {
-            SetStatus(L"快捷键 Ctrl+Alt+F9 不可用；仍可使用开始/停止按钮。");
+            SetStatus(ui::TextId::RecordingHotkeyUnavailable);
         }
 
         ::ShowWindow(window_, showCommand == SW_SHOWMINIMIZED ? SW_SHOWNORMAL : showCommand);
@@ -453,6 +471,7 @@ private:
             fullRadio_, regionRadio_, monitorLabel_, monitorCombo_, regionButton_,
             regionSummary_, resolutionLabel_, resolutionCombo_, fpsLabel_, fpsCombo_,
             qualityLabel_, qualityCombo_, qualityHint_, audioCheck_, micCheck_,
+            formatLabel_, formatCombo_,
             systemDeviceCombo_, micDeviceCombo_, outputLabel_, outputPath_, browseButton_,
             outputSummary_, statusLabel_,
             startButton_, openFolderButton_, screenshotButton_,
@@ -466,7 +485,7 @@ private:
         set(statusLabel_, bodyFont_);
     }
 
-    HWND CreateControl(const wchar_t* className, const wchar_t* text, DWORD style,
+    HWND CreateControl(const wchar_t* className, ui::TextId text, DWORD style,
                        int id = 0, DWORD exStyle = 0) {
         const std::wstring localizedText = ui::Text(text);
         HWND control = ::CreateWindowExW(
@@ -481,8 +500,9 @@ private:
 
     void PopulateLanguageCombo() {
         ::SendMessageW(languageCombo_, CB_RESETCONTENT, 0, 0);
-        const wchar_t* choices[] = {L"自动（跟随系统）", L"简体中文", L"English"};
-        for (int i = 0; i < 3; ++i) {
+        const ui::TextId choices[] = {ui::TextId::LanguageAutomatic,
+            ui::TextId::LanguageChinese, ui::TextId::LanguageEnglish};
+        for (std::size_t i = 0; i < std::size(choices); ++i) {
             const std::wstring label = ui::Text(choices[i]);
             ::SendMessageW(languageCombo_, CB_ADDSTRING, 0,
                            reinterpret_cast<LPARAM>(label.c_str()));
@@ -490,50 +510,18 @@ private:
         ::SendMessageW(languageCombo_, CB_SETCURSEL, ui::LanguagePreference(), 0);
     }
 
-    void RefreshLocalizedControls() {
-        const auto set = [](HWND control, std::wstring_view source) {
-            const std::wstring label = ui::Text(source);
-            ::SetWindowTextW(control, label.c_str());
-        };
-        ::SetWindowTextW(window_, ui::Text(L"轻录").c_str());
-        set(titleLabel_, L"轻录");
-        set(languageLabel_, L"语言");
-        set(subtitleLabel_, L"轻量、直接的屏幕录制");
-        set(sectionRange_, L"录制范围");
-        set(sectionQuality_, L"画质");
-        set(sectionAudio_, L"声音");
-        set(sectionOutput_, L"保存位置");
-        set(fullRadio_, L"全屏");
-        set(regionRadio_, L"区域");
-        set(monitorLabel_, L"显示器");
-        set(regionButton_, L"选择区域…");
-        set(resolutionLabel_, L"分辨率");
-        set(fpsLabel_, L"帧率");
-        set(qualityLabel_, L"画质");
-        set(qualityHint_, L"画质越高，文件越大");
-        set(audioCheck_, L"系统声音");
-        set(micCheck_, L"麦克风");
-        set(outputLabel_, L"保存到");
-        set(browseButton_, L"更改");
-        set(openFolderButton_, L"打开文件夹");
-        set(screenshotButton_, L"截图");
-        PopulateLanguageCombo();
-
-        const int resolutionSelection = static_cast<int>(::SendMessageW(
-            resolutionCombo_, CB_GETCURSEL, 0, 0));
+    void PopulateResolutionChoices(int selected) {
         ::SendMessageW(resolutionCombo_, CB_RESETCONTENT, 0, 0);
-        const wchar_t* resolutions[] = {L"原始尺寸", L"720p", L"1080p", L"1440p",
-                                        L"2160p", L"自定义…"};
-        for (int i = 0; i < 6; ++i) {
-            const std::wstring label = ui::Text(resolutions[i]);
+        for (std::size_t i = 0; i < std::size(kResolutionChoices); ++i) {
+            const std::wstring label = ui::Text(kResolutionChoices[i]);
             const LRESULT item = ::SendMessageW(resolutionCombo_, CB_ADDSTRING, 0,
                 reinterpret_cast<LPARAM>(label.c_str()));
-            ::SendMessageW(resolutionCombo_, CB_SETITEMDATA, item, i);
+            ::SendMessageW(resolutionCombo_, CB_SETITEMDATA, item, static_cast<LPARAM>(i));
         }
-        ::SendMessageW(resolutionCombo_, CB_SETCURSEL, resolutionSelection, 0);
+        ::SendMessageW(resolutionCombo_, CB_SETCURSEL, selected, 0);
+    }
 
-        const int qualitySelection = static_cast<int>(::SendMessageW(
-            qualityCombo_, CB_GETCURSEL, 0, 0));
+    void PopulateQualityChoices(int selected) {
         ::SendMessageW(qualityCombo_, CB_RESETCONTENT, 0, 0);
         for (int i = 0; i < kQualityCount; ++i) {
             const std::wstring label = ui::Text(kQualityOptions[i].name);
@@ -541,111 +529,194 @@ private:
                 reinterpret_cast<LPARAM>(label.c_str()));
             ::SendMessageW(qualityCombo_, CB_SETITEMDATA, item, i);
         }
-        ::SendMessageW(qualityCombo_, CB_SETCURSEL, qualitySelection, 0);
+        ::SendMessageW(qualityCombo_, CB_SETCURSEL, selected, 0);
+    }
+
+    std::span<const int> FrameRateOptions() const {
+        return format_ == RecordingFormat::Gif ? std::span<const int>(kGifFrameRates)
+                                               : std::span<const int>(kMp4FrameRates);
+    }
+
+    void PopulateFrameRateChoices(int selectedFps) {
+        ::SendMessageW(fpsCombo_, CB_RESETCONTENT, 0, 0);
+        int selected = 0;
+        int index = 0;
+        for (const int fps : FrameRateOptions()) {
+            const std::wstring label = ui::Format(ui::TextId::FrameRateValue, fps);
+            ::SendMessageW(fpsCombo_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(label.c_str()));
+            if (fps == selectedFps) selected = index;
+            ++index;
+        }
+        SetComboSelection(fpsCombo_, selected);
+    }
+
+    void RememberFormatOptions() {
+        if (format_ == RecordingFormat::Gif) {
+            gifLimit_ = SelectedLimit();
+            gifCustomBound_ = customBound_;
+            gifFps_ = SelectedFps();
+        } else {
+            mp4Limit_ = SelectedLimit();
+            mp4CustomBound_ = customBound_;
+            mp4Fps_ = SelectedFps();
+        }
+    }
+
+    void ApplyFormatOptions() {
+        const bool gif = format_ == RecordingFormat::Gif;
+        customBound_ = gif ? gifCustomBound_ : mp4CustomBound_;
+        lastResolutionIndex_ = static_cast<int>(gif ? gifLimit_ : mp4Limit_);
+        SetComboSelection(resolutionCombo_, lastResolutionIndex_);
+        PopulateFrameRateChoices(gif ? gifFps_ : mp4Fps_);
+    }
+
+    void ChangeFormat() {
+        const RecordingFormat selected = ComboSelection(formatCombo_) == 1
+            ? RecordingFormat::Gif : RecordingFormat::Mp4;
+        if (selected == format_) return;
+        RememberFormatOptions();
+        format_ = selected;
+        ApplyFormatOptions();
+        UpdateDerivedState(true);
+        UpdateUiState();
+        PersistSettings();
+    }
+
+    void RefreshLocalizedControls() {
+        const auto set = [](HWND control, ui::TextId source) {
+            const std::wstring label = ui::Text(source);
+            ::SetWindowTextW(control, label.c_str());
+        };
+        ::SetWindowTextW(window_, ui::Text(ui::TextId::AppName).c_str());
+        set(titleLabel_, ui::TextId::AppName);
+        set(languageLabel_, ui::TextId::LanguageLabel);
+        set(subtitleLabel_, ui::TextId::AppSubtitle);
+        set(sectionRange_, ui::TextId::CaptureArea);
+        set(sectionQuality_, ui::TextId::Quality);
+        set(sectionAudio_, ui::TextId::Audio);
+        set(sectionOutput_, ui::TextId::SaveLocation);
+        set(fullRadio_, ui::TextId::FullScreen);
+        set(regionRadio_, ui::TextId::Region);
+        set(monitorLabel_, ui::TextId::Display);
+        set(regionButton_, ui::TextId::SelectRegion);
+        set(resolutionLabel_, ui::TextId::Resolution);
+        set(fpsLabel_, ui::TextId::FrameRate);
+        set(qualityLabel_, ui::TextId::Quality);
+        set(formatLabel_, ui::TextId::FormatLabel);
+        set(qualityHint_, format_ == RecordingFormat::Gif ? ui::TextId::GifSilent : ui::TextId::QualityHint);
+        set(audioCheck_, ui::TextId::SystemAudio);
+        set(micCheck_, ui::TextId::Microphone);
+        set(outputLabel_, ui::TextId::SaveTo);
+        set(browseButton_, ui::TextId::Browse);
+        set(openFolderButton_, ui::TextId::OpenFolder);
+        set(screenshotButton_, ui::TextId::Screenshot);
+        PopulateLanguageCombo();
+        PopulateMonitorChoices(ComboSelection(monitorCombo_));
+        RelabelDefaultDeviceChoice(systemDeviceCombo_, ui::TextId::DefaultPlaybackDevice);
+        RelabelDefaultDeviceChoice(micDeviceCombo_, ui::TextId::DefaultInputDevice);
+
+        PopulateResolutionChoices(ComboSelection(resolutionCombo_));
+        PopulateQualityChoices(ComboSelection(qualityCombo_));
         UpdateDerivedState(true);
         UpdateUiState();
         Layout();
     }
 
     void CreateControls() {
-        titleLabel_ = CreateControl(L"STATIC", L"轻录", SS_LEFT, kTitleLabel);
-        languageLabel_ = CreateControl(L"STATIC", L"语言",
+        titleLabel_ = CreateControl(L"STATIC", ui::TextId::AppName, SS_LEFT, kTitleLabel);
+        languageLabel_ = CreateControl(L"STATIC", ui::TextId::LanguageLabel,
             SS_LEFT | SS_CENTERIMAGE, kLanguageLabel);
-        languageCombo_ = CreateControl(L"COMBOBOX", L"",
+        languageCombo_ = CreateControl(L"COMBOBOX", ui::TextId::Empty,
             CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, kLanguageCombo);
         ThemeControl(languageCombo_);
         PopulateLanguageCombo();
-        subtitleLabel_ = CreateControl(L"STATIC", L"轻量、直接的屏幕录制", SS_LEFT,
+        subtitleLabel_ = CreateControl(L"STATIC", ui::TextId::AppSubtitle, SS_LEFT,
                                        kSubtitleLabel);
 
-        sectionRange_ = CreateControl(L"STATIC", L"录制范围", SS_LEFT, kSectionRange);
-        sectionQuality_ = CreateControl(L"STATIC", L"画质", SS_LEFT, kSectionQuality);
-        sectionAudio_ = CreateControl(L"STATIC", L"声音", SS_LEFT, kSectionAudio);
-        sectionOutput_ = CreateControl(L"STATIC", L"保存位置", SS_LEFT, kSectionOutput);
+        sectionRange_ = CreateControl(L"STATIC", ui::TextId::CaptureArea, SS_LEFT, kSectionRange);
+        sectionQuality_ = CreateControl(L"STATIC", ui::TextId::Quality, SS_LEFT, kSectionQuality);
+        sectionAudio_ = CreateControl(L"STATIC", ui::TextId::Audio, SS_LEFT, kSectionAudio);
+        sectionOutput_ = CreateControl(L"STATIC", ui::TextId::SaveLocation, SS_LEFT, kSectionOutput);
 
-        fullRadio_ = CreateControl(L"BUTTON", L"全屏",
+        fullRadio_ = CreateControl(L"BUTTON", ui::TextId::FullScreen,
                                    BS_AUTORADIOBUTTON | WS_GROUP | WS_TABSTOP, kModeFull);
-        regionRadio_ = CreateControl(L"BUTTON", L"区域", BS_AUTORADIOBUTTON | WS_TABSTOP,
+        regionRadio_ = CreateControl(L"BUTTON", ui::TextId::Region, BS_AUTORADIOBUTTON | WS_TABSTOP,
                                      kModeRegion);
         ::CheckRadioButton(window_, kModeFull, kModeRegion, kModeFull);
 
-        monitorLabel_ = CreateControl(L"STATIC", L"显示器", SS_LEFT | SS_CENTERIMAGE,
+        monitorLabel_ = CreateControl(L"STATIC", ui::TextId::Display, SS_LEFT | SS_CENTERIMAGE,
                                       kLabelMonitor);
-        monitorCombo_ = CreateControl(L"COMBOBOX", L"",
+        monitorCombo_ = CreateControl(L"COMBOBOX", ui::TextId::Empty,
                                       CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP | WS_GROUP,
                                       kMonitorCombo);
         ThemeControl(monitorCombo_);
-        regionButton_ = CreateControl(L"BUTTON", L"选择区域…",
+        regionButton_ = CreateControl(L"BUTTON", ui::TextId::SelectRegion,
                                       BS_OWNERDRAW | WS_TABSTOP, kSelectRegionButton);
-        regionSummary_ = CreateControl(L"STATIC", L"未选择区域",
+        regionSummary_ = CreateControl(L"STATIC", ui::TextId::NoRegionSelected,
                                        SS_LEFT | SS_CENTERIMAGE | SS_ENDELLIPSIS,
                                        kRegionSummary);
 
-        resolutionLabel_ = CreateControl(L"STATIC", L"分辨率", SS_LEFT | SS_CENTERIMAGE,
+        resolutionLabel_ = CreateControl(L"STATIC", ui::TextId::Resolution, SS_LEFT | SS_CENTERIMAGE,
                                           kLabelResolution);
-        resolutionCombo_ = CreateControl(L"COMBOBOX", L"",
+        resolutionCombo_ = CreateControl(L"COMBOBOX", ui::TextId::Empty,
                                           CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP | WS_GROUP,
                                           kResolutionCombo);
         ThemeControl(resolutionCombo_);
-        const wchar_t* resolutions[] = {L"原始尺寸", L"720p", L"1080p", L"1440p", L"2160p",
-                                        L"自定义…"};
-        for (int i = 0; i < 6; ++i) {
-            const std::wstring localized = ui::Text(resolutions[i]);
-            const int index =
-                static_cast<int>(::SendMessageW(resolutionCombo_, CB_ADDSTRING, 0,
-                                                reinterpret_cast<LPARAM>(localized.c_str())));
-            ::SendMessageW(resolutionCombo_, CB_SETITEMDATA, index, i);
-        }
+        PopulateResolutionChoices(-1);
 
-        fpsLabel_ = CreateControl(L"STATIC", L"帧率", SS_LEFT | SS_CENTERIMAGE, kLabelFps);
-        fpsCombo_ = CreateControl(L"COMBOBOX", L"",
+        fpsLabel_ = CreateControl(L"STATIC", ui::TextId::FrameRate, SS_LEFT | SS_CENTERIMAGE, kLabelFps);
+        fpsCombo_ = CreateControl(L"COMBOBOX", ui::TextId::Empty,
                                   CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP | WS_GROUP,
                                   kFpsCombo);
         ThemeControl(fpsCombo_);
-        ::SendMessageW(fpsCombo_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"30 fps"));
-        ::SendMessageW(fpsCombo_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"60 fps"));
+        PopulateFrameRateChoices(kDefaultMp4FrameRate);
 
-        qualityLabel_ = CreateControl(L"STATIC", L"画质", SS_LEFT | SS_CENTERIMAGE,
+        qualityLabel_ = CreateControl(L"STATIC", ui::TextId::Quality, SS_LEFT | SS_CENTERIMAGE,
                                       kLabelQuality);
-        qualityCombo_ = CreateControl(L"COMBOBOX", L"",
+        qualityCombo_ = CreateControl(L"COMBOBOX", ui::TextId::Empty,
                                       CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP | WS_GROUP,
                                       kQualityCombo);
         ThemeControl(qualityCombo_);
-        for (int i = 0; i < kQualityCount; ++i) {
-            const int index =
-                static_cast<int>(::SendMessageW(qualityCombo_, CB_ADDSTRING, 0,
-                    reinterpret_cast<LPARAM>(ui::Text(kQualityOptions[i].name).c_str())));
-            ::SendMessageW(qualityCombo_, CB_SETITEMDATA, index, i);
-        }
-        qualityHint_ = CreateControl(L"STATIC", L"画质越高，文件越大", SS_LEFT | SS_CENTERIMAGE,
+        PopulateQualityChoices(-1);
+        qualityHint_ = CreateControl(L"STATIC", ui::TextId::QualityHint, SS_LEFT | SS_CENTERIMAGE,
                                      kQualityHint);
+        formatLabel_ = CreateControl(L"STATIC", ui::TextId::FormatLabel,
+            SS_LEFT | SS_CENTERIMAGE, kFormatLabel);
+        formatCombo_ = CreateControl(L"COMBOBOX", ui::TextId::Empty,
+            CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, kFormatCombo);
+        ThemeControl(formatCombo_);
+        for (ui::TextId choice : {ui::TextId::FormatMp4, ui::TextId::FormatGif}) {
+            const std::wstring label = ui::Text(choice);
+            ::SendMessageW(formatCombo_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(label.c_str()));
+        }
+        SetComboSelection(formatCombo_, 0);
 
-        audioCheck_ = CreateControl(L"BUTTON", L"系统声音",
+        audioCheck_ = CreateControl(L"BUTTON", ui::TextId::SystemAudio,
                                     BS_AUTOCHECKBOX | WS_TABSTOP | WS_GROUP, kAudioCheck);
-        micCheck_ = CreateControl(L"BUTTON", L"麦克风",
+        micCheck_ = CreateControl(L"BUTTON", ui::TextId::Microphone,
                                   BS_AUTOCHECKBOX | WS_TABSTOP, kMicCheck);
         systemDeviceCombo_ = CreateControl(
-            L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, kSystemDeviceCombo);
+            L"COMBOBOX", ui::TextId::Empty, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, kSystemDeviceCombo);
         micDeviceCombo_ = CreateControl(
-            L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, kMicDeviceCombo);
+            L"COMBOBOX", ui::TextId::Empty, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, kMicDeviceCombo);
         ThemeControl(systemDeviceCombo_);
         ThemeControl(micDeviceCombo_);
 
-        outputLabel_ = CreateControl(L"STATIC", L"保存到", SS_LEFT | SS_CENTERIMAGE,
+        outputLabel_ = CreateControl(L"STATIC", ui::TextId::SaveTo, SS_LEFT | SS_CENTERIMAGE,
                                      kLabelOutput);
-        outputPath_ = CreateControl(L"STATIC", L"", SS_LEFT | SS_CENTERIMAGE | SS_ENDELLIPSIS,
+        outputPath_ = CreateControl(L"STATIC", ui::TextId::Empty, SS_LEFT | SS_CENTERIMAGE | SS_ENDELLIPSIS,
                                     kOutputPath);
-        browseButton_ = CreateControl(L"BUTTON", L"更改", BS_OWNERDRAW | WS_TABSTOP,
+        browseButton_ = CreateControl(L"BUTTON", ui::TextId::Browse, BS_OWNERDRAW | WS_TABSTOP,
                                       kBrowseButton);
-        outputSummary_ = CreateControl(L"STATIC", L"", SS_LEFT | SS_NOPREFIX, kOutputSummary);
+        outputSummary_ = CreateControl(L"STATIC", ui::TextId::Empty, SS_LEFT | SS_NOPREFIX, kOutputSummary);
 
-        statusLabel_ = CreateControl(L"STATIC", L"就绪", SS_LEFT | SS_CENTERIMAGE,
+        statusLabel_ = CreateControl(L"STATIC", ui::TextId::Ready, SS_LEFT | SS_CENTERIMAGE,
                                      kStatusLabel);
-        openFolderButton_ = CreateControl(L"BUTTON", L"打开文件夹",
+        openFolderButton_ = CreateControl(L"BUTTON", ui::TextId::OpenFolder,
                                           BS_OWNERDRAW | WS_TABSTOP, kOpenFolderButton);
-        screenshotButton_ = CreateControl(L"BUTTON", L"截图", BS_OWNERDRAW | WS_TABSTOP,
+        screenshotButton_ = CreateControl(L"BUTTON", ui::TextId::Screenshot, BS_OWNERDRAW | WS_TABSTOP,
                                           kScreenshotButton);
-        startButton_ = CreateControl(L"BUTTON", L"开始录制", BS_OWNERDRAW | WS_TABSTOP,
+        startButton_ = CreateControl(L"BUTTON", ui::TextId::StartRecording, BS_OWNERDRAW | WS_TABSTOP,
                                      kStartButton);
         ::EnableWindow(openFolderButton_, FALSE);
         ApplyFontToControls();
@@ -687,21 +758,43 @@ private:
         const int rowHeight = Scale(dpi_, 30);
         const int buttonHeight = Scale(dpi_, 38);
 
+        const auto labelWidth = [&](HWND control) -> int {
+            std::wstring text(static_cast<std::size_t>(::GetWindowTextLengthW(control)) + 1, L'\0');
+            const int length = ::GetWindowTextW(control, text.data(), static_cast<int>(text.size()));
+            text.resize(static_cast<std::size_t>(length));
+            HDC dc = ::GetDC(control);
+            const auto font = reinterpret_cast<HFONT>(::SendMessageW(control, WM_GETFONT, 0, 0));
+            const auto previous = ::SelectObject(dc, font);
+            SIZE size{};
+            ::GetTextExtentPoint32W(dc, text.c_str(), static_cast<int>(text.size()), &size);
+            ::SelectObject(dc, previous);
+            ::ReleaseDC(control, dc);
+            return size.cx + Scale(dpi_, 4);
+        };
+        const int languageWidth = std::max(Scale(dpi_, 48), labelWidth(languageLabel_));
+        const int fullRadioWidth = std::max(Scale(dpi_, 68), labelWidth(fullRadio_) + Scale(dpi_, 22));
+        const int fieldLabelWidth = std::max({Scale(dpi_, 48), labelWidth(resolutionLabel_), labelWidth(qualityLabel_)});
+        const int fieldX = left + fieldLabelWidth + Scale(dpi_, 8);
+        const int secondColumnX = left + Scale(dpi_, 264);
+        const int fieldWidth = secondColumnX - fieldX - Scale(dpi_, 18);
+        const int secondLabelWidth = std::max({Scale(dpi_, 48), labelWidth(fpsLabel_), labelWidth(formatLabel_)});
+        const int secondFieldX = secondColumnX + secondLabelWidth + Scale(dpi_, 8);
+
         ::MoveWindow(titleLabel_, margin, Scale(dpi_, 12), width - margin * 2,
                      Scale(dpi_, 36), TRUE);
-        ::MoveWindow(languageLabel_, width - margin - Scale(dpi_, 174),
-                     Scale(dpi_, 14), Scale(dpi_, 48), Scale(dpi_, 28), TRUE);
+        ::MoveWindow(languageLabel_, width - margin - Scale(dpi_, 124) - Scale(dpi_, 8) - languageWidth,
+                     Scale(dpi_, 14), languageWidth, Scale(dpi_, 28), TRUE);
         ::MoveWindow(languageCombo_, width - margin - Scale(dpi_, 124),
                      Scale(dpi_, 14), Scale(dpi_, 124), Scale(dpi_, 28), TRUE);
         ::MoveWindow(subtitleLabel_, margin, Scale(dpi_, 48), width - margin * 2,
                      Scale(dpi_, 22), TRUE);
         ::MoveWindow(sectionRange_, left, labelY1, right - left, Scale(dpi_, 24), TRUE);
-        ::MoveWindow(sectionQuality_, left, labelY2, right - left, Scale(dpi_, 24), TRUE);
+        ::MoveWindow(sectionQuality_, left, labelY2, Scale(dpi_, 80), Scale(dpi_, 24), TRUE);
         ::MoveWindow(sectionAudio_, left, labelY3, right - left, Scale(dpi_, 24), TRUE);
         ::MoveWindow(sectionOutput_, left, labelY4, right - left, Scale(dpi_, 24), TRUE);
 
-        ::MoveWindow(fullRadio_, left, radioY, Scale(dpi_, 68), Scale(dpi_, 26), TRUE);
-        ::MoveWindow(regionRadio_, left + Scale(dpi_, 82), radioY, Scale(dpi_, 68),
+        ::MoveWindow(fullRadio_, left, radioY, fullRadioWidth, Scale(dpi_, 26), TRUE);
+        ::MoveWindow(regionRadio_, left + fullRadioWidth + Scale(dpi_, 14), radioY, Scale(dpi_, 68),
                      Scale(dpi_, 26), TRUE);
         ::MoveWindow(monitorLabel_, left, monitorY, Scale(dpi_, 48), Scale(dpi_, 24), TRUE);
         ::MoveWindow(monitorCombo_, left + Scale(dpi_, 56), monitorY, Scale(dpi_, 294),
@@ -710,20 +803,24 @@ private:
         ::MoveWindow(regionSummary_, left + Scale(dpi_, 124), regionY,
                      right - (left + Scale(dpi_, 124)), Scale(dpi_, 28), TRUE);
 
-        ::MoveWindow(resolutionLabel_, left, qualityRowY, Scale(dpi_, 48), Scale(dpi_, 24),
+        ::MoveWindow(resolutionLabel_, left, qualityRowY, fieldLabelWidth, Scale(dpi_, 24),
                      TRUE);
-        ::MoveWindow(resolutionCombo_, left + Scale(dpi_, 56), qualityRowY, Scale(dpi_, 190),
+        ::MoveWindow(resolutionCombo_, fieldX, qualityRowY, fieldWidth,
                      Scale(dpi_, 200), TRUE);
-        ::MoveWindow(fpsLabel_, left + Scale(dpi_, 264), qualityRowY, Scale(dpi_, 40),
+        ::MoveWindow(fpsLabel_, secondColumnX, qualityRowY, secondLabelWidth,
                      Scale(dpi_, 24), TRUE);
-        ::MoveWindow(fpsCombo_, left + Scale(dpi_, 308), qualityRowY, Scale(dpi_, 100),
+        ::MoveWindow(fpsCombo_, secondFieldX, qualityRowY, Scale(dpi_, 100),
                      Scale(dpi_, 200), TRUE);
-        ::MoveWindow(qualityLabel_, left, qualityRow2Y, Scale(dpi_, 48), Scale(dpi_, 24),
+        ::MoveWindow(qualityLabel_, left, qualityRow2Y, fieldLabelWidth, Scale(dpi_, 24),
                      TRUE);
-        ::MoveWindow(qualityCombo_, left + Scale(dpi_, 56), qualityRow2Y, Scale(dpi_, 190),
+        ::MoveWindow(qualityCombo_, fieldX, qualityRow2Y, fieldWidth,
                      Scale(dpi_, 200), TRUE);
-        ::MoveWindow(qualityHint_, left + Scale(dpi_, 264), qualityRow2Y,
-                     right - (left + Scale(dpi_, 264)), Scale(dpi_, 24), TRUE);
+        ::MoveWindow(qualityHint_, left + Scale(dpi_, 96), labelY2,
+                     right - (left + Scale(dpi_, 96)), Scale(dpi_, 24), TRUE);
+        ::MoveWindow(formatLabel_, secondColumnX, qualityRow2Y,
+                     secondLabelWidth, Scale(dpi_, 24), TRUE);
+        ::MoveWindow(formatCombo_, secondFieldX, qualityRow2Y,
+                     Scale(dpi_, 100), Scale(dpi_, 160), TRUE);
 
         const int microphoneY = audioY + Scale(dpi_, 32);
         const int deviceX = left + Scale(dpi_, 136);
@@ -824,7 +921,21 @@ private:
         return reinterpret_cast<LRESULT>(brush);
     }
 
-    void PopulateDeviceCombo(HWND combo, const wchar_t* defaultLabel,
+    void RelabelDefaultDeviceChoice(HWND combo, ui::TextId label) {
+        if (::SendMessageW(combo, CB_GETCOUNT, 0, 0) <= 0) return;
+        const LRESULT selected = ::SendMessageW(combo, CB_GETCURSEL, 0, 0);
+        const LRESULT defaultData = ::SendMessageW(combo, CB_GETITEMDATA, 0, 0);
+        const std::wstring text = ui::Text(label);
+        const LRESULT inserted = ::SendMessageW(combo, CB_INSERTSTRING, 0,
+            reinterpret_cast<LPARAM>(text.c_str()));
+        if (inserted >= 0) {
+            ::SendMessageW(combo, CB_SETITEMDATA, inserted, defaultData);
+            ::SendMessageW(combo, CB_DELETESTRING, inserted + 1, 0);
+            ::SendMessageW(combo, CB_SETCURSEL, selected, 0);
+        }
+    }
+
+    void PopulateDeviceCombo(HWND combo, ui::TextId defaultLabel,
                              const std::vector<AudioEndpointInfo>& endpoints,
                              std::vector<std::wstring>& ids) {
         ids.clear();
@@ -838,7 +949,7 @@ private:
             std::wstring name = endpoint.friendlyName.empty() ? endpoint.deviceName
                                                               : endpoint.friendlyName;
             if (name.empty()) {
-                name = ui::Text(L"音频设备");
+                name = ui::Text(ui::TextId::AudioDevice);
             }
             if (!endpoint.deviceName.empty() && endpoint.deviceName != name) {
                 name += L" · " + endpoint.deviceName;
@@ -854,9 +965,9 @@ private:
 
     void RefreshAudioDevices() {
         const AudioProbeResult probe = QueryAudioProbe(false, false);
-        PopulateDeviceCombo(systemDeviceCombo_, L"默认播放设备", probe.renderEndpoints,
+        PopulateDeviceCombo(systemDeviceCombo_, ui::TextId::DefaultPlaybackDevice, probe.renderEndpoints,
                             systemDeviceIds_);
-        PopulateDeviceCombo(micDeviceCombo_, L"默认输入设备", probe.captureEndpoints,
+        PopulateDeviceCombo(micDeviceCombo_, ui::TextId::DefaultInputDevice, probe.captureEndpoints,
                             microphoneDeviceIds_);
     }
 
@@ -883,25 +994,29 @@ private:
         return {};
     }
 
-    void RebuildMonitorList() {
+    void PopulateMonitorChoices(int selected) {
         ::SendMessageW(monitorCombo_, CB_RESETCONTENT, 0, 0);
-        displays_ = EnumerateDisplays();
-        int selected = 0;
         for (std::size_t i = 0; i < displays_.size(); ++i) {
             const MonitorInfo& monitor = displays_[i];
             const int width = monitor.virtualRect.right - monitor.virtualRect.left;
             const int height = monitor.virtualRect.bottom - monitor.virtualRect.top;
-            const std::wstring text =
-                Utf8ToWide(std::format("显示器 {} · {}×{} · {}", monitor.index, width,
-                                       height, WideToUtf8(monitor.friendlyName)));
+            const std::wstring text = ui::Format(ui::TextId::MonitorChoice,
+                monitor.index, width, height, monitor.friendlyName);
             const int index = static_cast<int>(
                 ::SendMessageW(monitorCombo_, CB_ADDSTRING, 0,
                                reinterpret_cast<LPARAM>(text.c_str())));
             ::SendMessageW(monitorCombo_, CB_SETITEMDATA, index, i);
-            if (monitor.primary) {
-                selected = static_cast<int>(i);
-            }
         }
+        ::SendMessageW(monitorCombo_, CB_SETCURSEL, selected, 0);
+    }
+
+    void RebuildMonitorList() {
+        displays_ = EnumerateDisplays();
+        int selected = 0;
+        for (std::size_t i = 0; i < displays_.size(); ++i) {
+            if (displays_[i].primary) selected = static_cast<int>(i);
+        }
+        PopulateMonitorChoices(selected);
         if (!displays_.empty()) {
             ::SendMessageW(monitorCombo_, CB_SETCURSEL, selected, 0);
             selectedMonitor_ = selected;
@@ -947,11 +1062,15 @@ private:
                 regionAvailable_ = true;
             }
         }
-        customBound_ = settings.customBound;
-        const int limitIndex = std::clamp(static_cast<int>(settings.limit), 0, 5);
-        ::SendMessageW(resolutionCombo_, CB_SETCURSEL, limitIndex, 0);
-        lastResolutionIndex_ = limitIndex;
-        ::SendMessageW(fpsCombo_, CB_SETCURSEL, settings.fps == 60 ? 1 : 0, 0);
+        format_ = settings.format;
+        mp4Limit_ = settings.limit;
+        mp4CustomBound_ = settings.customBound;
+        mp4Fps_ = settings.fps;
+        gifLimit_ = settings.gifLimit;
+        gifCustomBound_ = settings.gifCustomBound;
+        gifFps_ = settings.gifFps;
+        SetComboSelection(formatCombo_, format_ == RecordingFormat::Gif ? 1 : 0);
+        ApplyFormatOptions();
         int qualityIndex = kDefaultQualityIndex;
         for (int i = 0; i < kQualityCount; ++i) {
             if (kQualityOptions[i].bitrateMbps == settings.bitrateMbps) {
@@ -1001,7 +1120,10 @@ private:
     }
 
     int SelectedFps() const {
-        return ComboSelection(fpsCombo_) == 1 ? 60 : 30;
+        const int index = ComboSelection(fpsCombo_);
+        const std::span<const int> options = FrameRateOptions();
+        return index >= 0 && static_cast<std::size_t>(index) < options.size()
+            ? options[index] : format_ == RecordingFormat::Gif ? kDefaultGifFrameRate : kDefaultMp4FrameRate;
     }
 
     int SelectedQualityIndex() const {
@@ -1033,13 +1155,13 @@ private:
         const MonitorInfo* monitor = SelectedMonitor();
         if (monitor == nullptr) {
             if (error != nullptr) {
-                *error = L"未检测到可用显示器";
+                *error = ui::Text(ui::TextId::NoDisplayAvailable);
             }
             return std::nullopt;
         }
         if (RegionMode() && !regionAvailable_) {
             if (error != nullptr) {
-                *error = L"请先选择录制区域";
+                *error = ui::Text(ui::TextId::SelectCaptureAreaFirst);
             }
             return std::nullopt;
         }
@@ -1048,7 +1170,7 @@ private:
         const int height = source.bottom - source.top;
         if (width < kMinOutputDimension || height < kMinOutputDimension) {
             if (error != nullptr) {
-                *error = L"录制区域至少需要 64×64 物理像素";
+                *error = ui::Format(ui::TextId::CaptureAreaMinimum, kMinOutputDimension, kMinOutputDimension);
             }
             return std::nullopt;
         }
@@ -1061,7 +1183,7 @@ private:
         const int sourceWidth = source.right - source.left;
         const int sourceHeight = source.bottom - source.top;
         if (sourceWidth < kMinOutputDimension || sourceHeight < kMinOutputDimension) {
-            SetStatus(L"请先选择有效的录制区域", true);
+            SetStatus(ui::TextId::SelectValidCaptureArea, true);
             SetComboSelection(resolutionCombo_, lastResolutionIndex_);
             return;
         }
@@ -1079,13 +1201,14 @@ private:
     }
 
     std::wstring AudioDescription() const {
+        if (format_ == RecordingFormat::Gif) return ui::Text(ui::TextId::GifSilent);
         const bool audio = ::SendMessageW(audioCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
         const bool microphone =
             ::SendMessageW(micCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
-        if (audio && microphone) return ui::Text(L"系统声音 + 麦克风");
-        if (audio) return ui::Text(L"系统声音");
-        if (microphone) return ui::Text(L"麦克风");
-        return ui::Text(L"声音已关闭（录制中可开启）");
+        if (audio && microphone) return ui::Text(ui::TextId::SystemAndMicrophone);
+        if (audio) return ui::Text(ui::TextId::SystemAudio);
+        if (microphone) return ui::Text(ui::TextId::Microphone);
+        return ui::Text(ui::TextId::AudioOffDescription);
     }
 
     void UpdateDerivedState(bool updateStatus) {
@@ -1095,25 +1218,19 @@ private:
         const int sourceHeight = source.bottom - source.top;
 
         if (monitor == nullptr) {
-            ::SetWindowTextW(regionSummary_, ui::Text(L"未检测到显示器").c_str());
+            ::SetWindowTextW(regionSummary_, ui::Text(ui::TextId::NoDisplayDetected).c_str());
         } else if (RegionMode()) {
             if (regionAvailable_) {
-                const std::wstring text = Utf8ToWide(std::format(
-                    "{} {} · {} {}×{} · {} ({}, {})", WideToUtf8(ui::Text(L"显示器")),
-                    monitor->index, WideToUtf8(ui::Text(L"源区域")), sourceWidth,
-                    sourceHeight, WideToUtf8(ui::Text(L"起点")), source.left, source.top));
-                const std::wstring localized = ui::Text(text);
-                ::SetWindowTextW(regionSummary_, localized.c_str());
+                const std::wstring text = ui::Format(ui::TextId::RegionSummary,
+                    monitor->index, sourceWidth, sourceHeight, source.left, source.top);
+                ::SetWindowTextW(regionSummary_, text.c_str());
             } else {
-                ::SetWindowTextW(regionSummary_, ui::Text(L"未选择区域").c_str());
+                ::SetWindowTextW(regionSummary_, ui::Text(ui::TextId::NoRegionSelected).c_str());
             }
         } else {
-            const std::wstring text = Utf8ToWide(
-                std::format("{} · {} {} · {}×{}", WideToUtf8(ui::Text(L"全屏")),
-                            WideToUtf8(ui::Text(L"显示器")), monitor->index,
-                            sourceWidth, sourceHeight));
-            const std::wstring localized = ui::Text(text);
-            ::SetWindowTextW(regionSummary_, localized.c_str());
+            const std::wstring text = ui::Format(ui::TextId::FullScreenSummary,
+                monitor->index, sourceWidth, sourceHeight);
+            ::SetWindowTextW(regionSummary_, text.c_str());
         }
 
         std::wstring sizeError;
@@ -1124,46 +1241,38 @@ private:
         std::wstring outputText;
         if (monitor == nullptr) {
             valid = false;
-            statusError = L"未检测到可用显示器";
+            statusError = ui::Text(ui::TextId::NoDisplayAvailable);
         } else if (RegionMode() && !regionAvailable_) {
             valid = false;
-            statusError = L"请先选择录制区域";
+            statusError = ui::Text(ui::TextId::SelectCaptureAreaFirst);
         } else if (!output.has_value()) {
             valid = false;
-            statusError = L"无法生成输出画面：" + sizeError;
+            statusError = ui::Format(ui::TextId::CannotCreateOutputFrame, ui::LocalizeMessage(sizeError));
         }
         if (outputDirectory_.empty()) {
             valid = false;
-            statusError = L"请选择导出目录";
+            statusError = ui::Text(ui::TextId::ChooseExportFolder);
         }
-        if (output.has_value()) {
-            const std::wstring quality = kQualityOptions[SelectedQualityIndex()].name;
-            if (ui::IsEnglishLanguage()) {
-                outputText = std::format(
-                    L"{}×{} · {} fps · {} quality · est. {} / 60 sec",
-                    output->output.width, output->output.height, SelectedFps(),
-                    ui::Text(quality),
-                    Utf8ToWide(FormatBytes(EstimateBytesWithAudioTracks(
-                        MbpsToBitsPerSecond(static_cast<double>(bitrate)), 3, 60))));
-            } else {
-                outputText = Utf8ToWide(std::format(
-                    "{}×{} · {} fps · {}画质 · 预计 60 秒约 {}", output->output.width,
-                    output->output.height, SelectedFps(), WideToUtf8(quality),
-                    FormatBytes(EstimateBytesWithAudioTracks(
-                        MbpsToBitsPerSecond(static_cast<double>(bitrate)), 3, 60))));
-            }
-            outputText += L"\r\nH.264 / MP4";
-            outputText += ui::IsEnglishLanguage()
-                ? L" + 3 AAC tracks (mix / system / mic)"
-                : L" + 3 条 AAC 音轨（混音 / 系统声 / 麦克风）";
-            const std::wstring localized = ui::Text(outputText);
-            ::SetWindowTextW(outputSummary_, localized.c_str());
+        if (output.has_value() && format_ == RecordingFormat::Gif) {
+            outputText = ui::Format(ui::TextId::GifOutputSummary,
+                output->output.width, output->output.height, SelectedFps());
+            ::SetWindowTextW(outputSummary_, outputText.c_str());
+        } else if (output.has_value()) {
+            const std::wstring quality = ui::Text(kQualityOptions[SelectedQualityIndex()].name);
+            outputText = ui::Format(ui::TextId::OutputSummary,
+                output->output.width, output->output.height, SelectedFps(), quality,
+                kEstimateDurationSeconds,
+                Utf8ToWide(FormatBytes(EstimateBytesWithAudioTracks(
+                    MbpsToBitsPerSecond(static_cast<double>(bitrate)),
+                    kAudioTrackCount, kEstimateDurationSeconds))));
+            outputText += L"\r\n" + ui::Format(ui::TextId::OutputCodecSummary, kAudioTrackCount);
+            ::SetWindowTextW(outputSummary_, outputText.c_str());
         } else {
-            outputText = L"请先选择有效的录制范围和画质";
+            outputText = ui::Text(ui::TextId::SelectValidAreaAndQuality);
             if (!sizeError.empty()) {
                 outputText = sizeError;
             }
-            const std::wstring localized = ui::Text(outputText);
+            const std::wstring localized = ui::LocalizeMessage(outputText);
             ::SetWindowTextW(outputSummary_, localized.c_str());
         }
         configValid_ = valid;
@@ -1174,11 +1283,11 @@ private:
             if (!valid) {
                 SetStatus(statusError, true);
             } else {
-                std::wstring line = ui::Text(L"就绪 · ") + ui::Text(AudioDescription());
+                std::wstring line = ui::Format(ui::TextId::ReadyDescription, AudioDescription());
                 if (hotkeyStartStop_) {
-                    line += ui::Text(L" · Ctrl+Alt+F9 开始/停止");
+                    line += ui::Text(ui::TextId::RecordingHotkeyHint);
                 } else {
-                    line += ui::Text(L" · 使用按钮开始/停止");
+                    line += ui::Text(ui::TextId::RecordingButtonsHint);
                 }
                 SetStatus(line);
             }
@@ -1195,16 +1304,21 @@ private:
         ::EnableWindow(regionButton_, enableSettings);
         ::EnableWindow(resolutionCombo_, enableSettings);
         ::EnableWindow(fpsCombo_, enableSettings);
-        ::EnableWindow(qualityCombo_, enableSettings);
-        ::EnableWindow(audioCheck_, enableSettings);
-        ::EnableWindow(micCheck_, enableSettings);
+        ::EnableWindow(formatCombo_, enableSettings);
+        const bool audioSupported = format_ == RecordingFormat::Mp4;
+        ::EnableWindow(qualityLabel_, ready && audioSupported ? TRUE : FALSE);
+        ::EnableWindow(qualityCombo_, ready && audioSupported ? TRUE : FALSE);
+        ::EnableWindow(audioCheck_, ready && audioSupported ? TRUE : FALSE);
+        ::EnableWindow(micCheck_, ready && audioSupported ? TRUE : FALSE);
+        ::SetWindowTextW(qualityHint_, ui::Text(audioSupported
+            ? ui::TextId::QualityHint : ui::TextId::GifSilent).c_str());
         const bool systemAudioOn =
             ::SendMessageW(audioCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
         const bool microphoneOn =
             ::SendMessageW(micCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
         ::EnableWindow(systemDeviceCombo_,
-                       ready && systemAudioOn ? TRUE : FALSE);
-        ::EnableWindow(micDeviceCombo_, ready && microphoneOn ? TRUE : FALSE);
+                       ready && audioSupported && systemAudioOn ? TRUE : FALSE);
+        ::EnableWindow(micDeviceCombo_, ready && audioSupported && microphoneOn ? TRUE : FALSE);
         ::EnableWindow(browseButton_, enableSettings);
         ::EnableWindow(startButton_, ready && configValid_ ? TRUE : FALSE);
         ::EnableWindow(openFolderButton_, !lastOutputFolder_.empty() ? TRUE : FALSE);
@@ -1214,18 +1328,22 @@ private:
             if (configValid_) {
                 UpdateDerivedState(false);
             }
-            ::SetWindowTextW(startButton_, ui::Text(L"开始录制").c_str());
+            ::SetWindowTextW(startButton_, ui::Text(ui::TextId::StartRecording).c_str());
         } else {
             ::EnableWindow(startButton_, FALSE);
             const std::wstring label = ui::Text(phase_ == Phase::Screenshot
-                                                   ? L"正在截图…" : L"录制中…");
+                ? ui::TextId::CapturingScreenshot : ui::TextId::RecordingBusy);
             ::SetWindowTextW(startButton_, label.c_str());
         }
     }
 
+    void SetStatus(ui::TextId id, bool error = false) {
+        SetStatus(ui::Text(id), error);
+    }
+
     void SetStatus(std::wstring_view text, bool error = false) {
         statusError_ = error;
-        const std::wstring localized = ui::Text(text);
+        const std::wstring localized = ui::LocalizeMessage(text);
         ::SetWindowTextW(statusLabel_, localized.c_str());
         ::InvalidateRect(statusLabel_, nullptr, TRUE);
     }
@@ -1233,22 +1351,22 @@ private:
     bool ValidateConfig(RecordingConfig& config, std::wstring& error) {
         const MonitorInfo* monitor = SelectedMonitor();
         if (monitor == nullptr) {
-            error = L"未检测到可用显示器";
+            error = ui::Text(ui::TextId::NoDisplayAvailable);
             return false;
         }
         if (RegionMode() && !regionAvailable_) {
-            error = L"请先选择录制区域";
+            error = ui::Text(ui::TextId::SelectCaptureAreaFirst);
             return false;
         }
         const RECT source = CurrentSourceRect();
         const int width = source.right - source.left;
         const int height = source.bottom - source.top;
         if (width < kMinOutputDimension || height < kMinOutputDimension) {
-            error = L"录制区域至少需要 64×64 物理像素";
+            error = ui::Format(ui::TextId::CaptureAreaMinimum, kMinOutputDimension, kMinOutputDimension);
             return false;
         }
         if (outputDirectory_.empty()) {
-            error = L"请选择导出目录";
+            error = ui::Text(ui::TextId::ChooseExportFolder);
             return false;
         }
         std::wstring sizeError;
@@ -1262,13 +1380,14 @@ private:
             monitor->virtualRect.right - monitor->virtualRect.left,
             monitor->virtualRect.bottom - monitor->virtualRect.top};
         config.sourceRect = source;
+        config.format = format_;
         config.limit = SelectedLimit();
         config.customBound = customBound_;
         config.fps = SelectedFps();
         config.bitrateMbps = SelectedBitrate();
-        config.systemAudio =
+        config.systemAudio = format_ == RecordingFormat::Mp4 &&
             ::SendMessageW(audioCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
-        config.microphone =
+        config.microphone = format_ == RecordingFormat::Mp4 &&
             ::SendMessageW(micCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
         config.systemAudioDeviceId =
             SelectedDeviceId(systemDeviceCombo_, systemDeviceIds_);
@@ -1305,7 +1424,7 @@ private:
                                    &floatingError)) {
                 floating_.reset();
                 SetStatus(floatingError, true);
-                MessageBoxUi(window_, floatingError.c_str(), L"无法开始录制",
+                MessageBoxUi(window_, floatingError.c_str(), ui::TextId::CannotStartRecordingTitle,
                               MB_ICONERROR | MB_OK);
                 return;
             }
@@ -1313,7 +1432,7 @@ private:
 
         const MonitorInfo* monitor = SelectedMonitor();
         if (monitor == nullptr) {
-            SetStatus(L"未检测到可用显示器", true);
+            SetStatus(ui::TextId::NoDisplayAvailable, true);
             return;
         }
 
@@ -1337,11 +1456,10 @@ private:
             if (!outside) {
                 floating_->Destroy();
                 floating_.reset();
-                SetStatus(L"无法从录制画面中排除悬浮窗，已取消开始", true);
+                SetStatus(ui::TextId::FloatingExclusionFailed, true);
                 MessageBoxUi(window_,
-                              L"系统拒绝了悬浮窗的捕获排除设置，且当前范围无法把控制窗放在录制区域外。"
-                              L"请换用区域录制或检查系统版本。",
-                              L"无法开始录制", MB_ICONERROR | MB_OK);
+                              ui::TextId::FloatingExclusionAdvice,
+                              ui::TextId::CannotStartRecordingTitle, MB_ICONERROR | MB_OK);
                 return;
             }
         }
@@ -1351,14 +1469,14 @@ private:
         systemAudioEnabled_ = config.systemAudio;
         microphoneEnabled_ = config.microphone;
         audioRevision_ = 0;
-        pendingAudioSource_.clear();
+        pendingAudioSource_ = ui::TextId::Empty;
         phase_ = Phase::Countdown;
         countdownActive_ = true;
-        countdownEnd_ = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+        countdownEnd_ = std::chrono::steady_clock::now() + kCountdownDuration;
         lastCountdownValue_ = -1;
         UpdateUiState();
-        SetStatus(L"即将开始录制…");
-        floating_->SetContent(L"3 秒后开始", true, L"取消");
+        SetStatus(ui::TextId::RecordingAboutToStart);
+        floating_->SetContent(ui::Format(ui::TextId::Countdown, kCountdownDuration.count()), true, ui::TextId::Cancel);
         ::ShowWindow(window_, SW_HIDE);
         floating_->Show();
     }
@@ -1382,7 +1500,7 @@ private:
                 if (value != lastCountdownValue_) {
                     lastCountdownValue_ = value;
                     floating_->SetContent(
-                        Utf8ToWide(std::format("{} 秒后开始", value)), true, L"取消");
+                        ui::Format(ui::TextId::Countdown, value), true, ui::TextId::Cancel);
                 }
             }
             return;
@@ -1397,25 +1515,23 @@ private:
                 FinishSession(state == RecorderState::Finished);
                 return;
             }
-            std::wstring text = L"正在保存…";
+            std::wstring text = ui::Text(ui::TextId::Saving);
             const auto savingSeconds = std::chrono::duration_cast<std::chrono::seconds>(
                                            std::chrono::steady_clock::now() -
                                            stopPressedAt_)
                                            .count();
-            if (savingSeconds >= 10) {
-                text += ui::IsEnglishLanguage()
-                    ? L" Elapsed: " + std::to_wstring(savingSeconds) + L" seconds"
-                    : L" 已用 " + std::to_wstring(savingSeconds) + L" 秒";
+            if (savingSeconds >= kSavingProgressDelay.count()) {
+                text = ui::Format(ui::TextId::SavingElapsed, savingSeconds);
             }
             if (floating_ != nullptr) {
-                floating_->SetContent(text, false, L"");
+                floating_->SetContent(text, false, ui::TextId::Empty);
             }
             return;
         }
         switch (state) {
             case RecorderState::Starting:
                 phase_ = Phase::Starting;
-                floating_->SetContent(L"正在启动…", true, L"取消");
+                floating_->SetContent(ui::TextId::Starting, true, ui::TextId::Cancel);
                 break;
             case RecorderState::Recording: {
                 phase_ = Phase::Recording;
@@ -1425,32 +1541,33 @@ private:
                 if (audio.revision != audioRevision_) {
                     audioRevision_ = audio.revision;
                     if (!audio.error.empty()) {
-                        pendingAudioSource_.clear();
+                        pendingAudioSource_ = ui::TextId::Empty;
                         ShowRecordingMessage(audio.error, true);
-                    } else if (!audio.pending && !pendingAudioSource_.empty()) {
-                        ShowRecordingMessage(pendingAudioSource_ +
-                            (pendingAudioEnabled_ ? L"已开启" : L"已关闭"));
-                        pendingAudioSource_.clear();
+                    } else if (!audio.pending && pendingAudioSource_ != ui::TextId::Empty) {
+                        ShowRecordingMessage(ui::Format(pendingAudioEnabled_
+                            ? ui::TextId::SourceEnabled : ui::TextId::SourceDisabled,
+                            ui::Text(pendingAudioSource_)));
+                        pendingAudioSource_ = ui::TextId::Empty;
                     }
                 }
-                std::wstring text = L"录制中  " + FormatDuration(session_->elapsed100ns());
+                std::wstring text = ui::Format(ui::TextId::RecordingTime, FormatDuration(session_->elapsed100ns()));
                 if (std::chrono::steady_clock::now() < transientMessageUntil_) {
                     text = transientMessage_;
                 }
-                floating_->SetContent(text, true, L"停止");
+                floating_->SetContent(text, true, ui::TextId::Stop);
                 floating_->SetRecordingControls(true, audio.pending,
-                                                systemAudioEnabled_, microphoneEnabled_);
+                    systemAudioEnabled_, microphoneEnabled_, config_.format == RecordingFormat::Mp4);
                 floating_->SetMicrophoneLevel(microphoneEnabled_
                     ? session_->microphoneLevel() : 0.0f);
                 break;
             }
             case RecorderState::Stopping:
                 phase_ = Phase::Saving;
-                floating_->SetContent(L"正在停止…", false, L"");
+                floating_->SetContent(ui::TextId::Stopping, false, ui::TextId::Empty);
                 break;
             case RecorderState::Saving:
                 phase_ = Phase::Saving;
-                floating_->SetContent(L"正在保存…", false, L"");
+                floating_->SetContent(ui::TextId::Saving, false, ui::TextId::Empty);
                 break;
             case RecorderState::Finished:
             case RecorderState::Failed:
@@ -1470,13 +1587,13 @@ private:
             phase_ = Phase::Idle;
             DestroyFloating();
             ShowMainWindow();
-            SetStatus(L"无法开始录制：" + error, true);
-            MessageBoxUi(window_, error.c_str(), L"无法开始录制", MB_ICONERROR | MB_OK);
+            SetStatus(ui::Format(ui::TextId::CannotStartRecording, ui::LocalizeMessage(error)), true);
+            MessageBoxUi(window_, error.c_str(), ui::TextId::CannotStartRecordingTitle, MB_ICONERROR | MB_OK);
             UpdateUiState();
             return;
         }
         phase_ = Phase::Starting;
-        floating_->SetContent(L"正在启动…", true, L"取消");
+        floating_->SetContent(ui::TextId::Starting, true, ui::TextId::Cancel);
     }
 
     void OnFloatingAction() {
@@ -1495,7 +1612,7 @@ private:
             session_->Stop();
             phase_ = Phase::Saving;
             if (floating_ != nullptr) {
-                floating_->SetContent(L"正在保存…", false, L"");
+                floating_->SetContent(ui::TextId::Saving, false, ui::TextId::Empty);
             }
         }
     }
@@ -1509,7 +1626,7 @@ private:
         phase_ = Phase::Idle;
         DestroyFloating();
         ShowMainWindow();
-        SetStatus(L"已取消录制");
+        SetStatus(ui::TextId::RecordingCancelled);
         UpdateUiState();
     }
 
@@ -1519,12 +1636,17 @@ private:
             return;
         }
         AppSettings settings;
+        RememberFormatOptions();
         settings.monitorDeviceName = monitor->deviceName;
         settings.hasRegion = regionAvailable_;
         settings.region = regionRect_;
-        settings.limit = SelectedLimit();
-        settings.customBound = customBound_;
-        settings.fps = SelectedFps();
+        settings.format = format_;
+        settings.limit = mp4Limit_;
+        settings.customBound = mp4CustomBound_;
+        settings.fps = mp4Fps_;
+        settings.gifLimit = gifLimit_;
+        settings.gifCustomBound = gifCustomBound_;
+        settings.gifFps = gifFps_;
         settings.bitrateMbps = SelectedBitrate();
         settings.systemAudio =
             ::SendMessageW(audioCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
@@ -1557,28 +1679,33 @@ private:
             ::EnableWindow(openFolderButton_, TRUE);
             PersistSettings();
         } else {
-            std::wstring message = result.error;
+            std::wstring message = ui::LocalizeMessage(result.error);
             if (message.empty()) {
-                message = finishedStateSuccess ? L"录制已结束，但结果不可用" : L"录制失败";
+                message = ui::Text(finishedStateSuccess ? ui::TextId::RecordingResultUnavailable : ui::TextId::RecordingFailed);
             }
             if (!result.partialPath.empty()) {
-                message += ui::Text(L"\r\n未完成文件：") + result.partialPath;
+                message += ui::Format(ui::TextId::IncompleteFile, result.partialPath);
+            }
+            for (const std::wstring& path : result.recoveryPaths) {
+                if (path != result.partialPath) message += ui::Format(ui::TextId::AudioRecoveryFile, path);
             }
             if (!screenshotFailure_.empty()) {
-                message += ui::Text(L"\r\n截图失败：") + screenshotFailure_;
+                message += ui::Format(ui::TextId::ScreenshotFailureDetails,
+                    ui::LocalizeMessage(screenshotFailure_));
             }
             SetStatus(message, true);
-            MessageBoxUi(window_, message.c_str(), L"录制结束", MB_ICONERROR | MB_OK);
+            MessageBoxUi(window_, message.c_str(), ui::TextId::RecordingFinished, MB_ICONERROR | MB_OK);
         }
         UpdateDerivedState(false);
         UpdateUiState();
         if (haveResult && result.success) {
             SetStatus(screenshotFailure_.empty()
-                          ? L"已保存：" + FileNameOf(result.finalPath)
-                          : L"视频已保存；截图失败：" + screenshotFailure_,
+                          ? ui::Format(ui::TextId::SavedFile, FileNameOf(result.finalPath))
+                          : ui::Format(ui::TextId::SavedVideoScreenshotFailed,
+                                ui::LocalizeMessage(screenshotFailure_)),
                       !screenshotFailure_.empty());
             if (!screenshotFailure_.empty()) {
-                MessageBoxUi(window_, screenshotFailure_.c_str(), L"截图保存失败",
+                MessageBoxUi(window_, screenshotFailure_.c_str(), ui::TextId::ScreenshotSaveFailedTitle,
                               MB_ICONWARNING | MB_OK);
             }
         }
@@ -1624,7 +1751,7 @@ private:
             }
         }
         if (selectedIndex < 0) {
-            SetStatus(L"选择的显示器已不可用", true);
+            SetStatus(ui::TextId::SelectedDisplayUnavailable, true);
             return;
         }
         selectedMonitor_ = selectedIndex;
@@ -1657,28 +1784,35 @@ private:
                         SW_SHOWNORMAL);
     }
 
-    void ShowRecordingMessage(const std::wstring& message, bool error = false) {
+    void ShowRecordingMessage(ui::TextId id, bool error = false) {
+        ShowRecordingMessage(ui::Text(id), error);
+    }
+
+    void ShowRecordingMessage(const std::wstring& message, bool error = false,
+                              ui::TextId brief = ui::TextId::Empty) {
         if (phase_ == Phase::Recording && floating_ != nullptr) {
-            transientMessage_ = message.starts_with(L"已截图：") ? L"截图已保存" : message;
-            transientMessageUntil_ = std::chrono::steady_clock::now() + std::chrono::seconds(3);
-            floating_->SetContent(transientMessage_, true, L"停止");
+            transientMessage_ = brief == ui::TextId::Empty ? ui::LocalizeMessage(message) : ui::Text(brief);
+            transientMessageUntil_ = std::chrono::steady_clock::now() + kTransientMessageDuration;
+            floating_->SetContent(transientMessage_, true, ui::TextId::Stop);
         }
         SetStatus(message, error);
     }
 
     void ToggleRecordingAudio(bool systemAudio) {
-        if (phase_ != Phase::Recording || session_ == nullptr || stopPressed_) return;
+        if (phase_ != Phase::Recording || session_ == nullptr || stopPressed_ ||
+            config_.format != RecordingFormat::Mp4) return;
         const bool systemEnabled = systemAudio ? !systemAudioEnabled_ : systemAudioEnabled_;
         const bool micEnabled = systemAudio ? microphoneEnabled_ : !microphoneEnabled_;
         if (!session_->SetAudioEnabled(systemEnabled, micEnabled)) {
-            ShowRecordingMessage(L"当前无法更改录制声音", true);
+            ShowRecordingMessage(ui::TextId::CannotChangeRecordingAudio, true);
             return;
         }
-        pendingAudioSource_ = systemAudio ? L"系统声音" : L"麦克风";
+        pendingAudioSource_ = systemAudio ? ui::TextId::SystemAudio : ui::TextId::Microphone;
         pendingAudioEnabled_ = systemAudio ? systemEnabled : micEnabled;
         floating_->SetRecordingControls(true, true, systemAudioEnabled_, microphoneEnabled_);
-        ShowRecordingMessage((pendingAudioEnabled_ ? L"正在开启" : L"正在关闭") +
-                             pendingAudioSource_ + L"…");
+        ShowRecordingMessage(ui::Format(pendingAudioEnabled_
+            ? ui::TextId::SourceEnabling : ui::TextId::SourceDisabling,
+            ui::Text(pendingAudioSource_)));
     }
 
     void PollScreenshots() {
@@ -1697,15 +1831,16 @@ private:
             if (event.result.ok) {
                 lastOutputFolder_ = std::filesystem::path(event.result.path).parent_path().wstring();
                 if (screenshotFailure_.empty()) {
-                    ShowRecordingMessage(L"已截图：" + FileNameOf(event.result.path));
+                    ShowRecordingMessage(ui::Format(ui::TextId::ScreenshotSavedFile, FileNameOf(event.result.path)),
+                                         false, ui::TextId::ScreenshotSaved);
                 } else {
-                    ShowRecordingMessage(L"截图失败：" + screenshotFailure_, true);
+                    ShowRecordingMessage(ui::Format(ui::TextId::ScreenshotFailure, ui::LocalizeMessage(screenshotFailure_)), true);
                 }
             } else {
                 closingPending_ = false;
                 if (!screenshotFailure_.empty()) screenshotFailure_ += L"\r\n";
-                screenshotFailure_ += event.result.error;
-                ShowRecordingMessage(L"截图失败：" + screenshotFailure_, true);
+                screenshotFailure_ += ui::LocalizeMessage(event.result.error);
+                ShowRecordingMessage(ui::Format(ui::TextId::ScreenshotFailure, ui::LocalizeMessage(screenshotFailure_)), true);
             }
         }
         if (completed) UpdateUiState();
@@ -1719,12 +1854,12 @@ private:
     void TakeScreenshot() {
         if (closingPending_ || stopPressed_ ||
             (phase_ != Phase::Idle && phase_ != Phase::Recording)) {
-            ShowRecordingMessage(L"当前状态不能截图", true);
+            ShowRecordingMessage(ui::TextId::ScreenshotUnavailable, true);
             return;
         }
-        if (screenshotWorker_.pending() >= 2 ||
+        if (screenshotWorker_.pending() >= kMaxPendingScreenshots ||
             (phase_ == Phase::Idle && screenshotWorker_.pending() != 0)) {
-            ShowRecordingMessage(L"截图正在保存，请稍后", true);
+            ShowRecordingMessage(ui::TextId::ScreenshotSavingWait, true);
             return;
         }
         std::wstring error;
@@ -1733,20 +1868,20 @@ private:
             ScreenshotFrame frame;
             if (session_ == nullptr || !session_->CopyScreenshot(frame, &error) ||
                 !screenshotWorker_.SubmitSnapshot(std::move(frame), config_.outputDirectory, &error)) {
-                ShowRecordingMessage(L"截图失败：" + error, true);
+                ShowRecordingMessage(ui::Format(ui::TextId::ScreenshotFailure, ui::LocalizeMessage(error)), true);
                 return;
             }
             if (firstRequest) screenshotFailure_.clear();
-            ShowRecordingMessage(L"正在保存截图…");
+            ShowRecordingMessage(ui::TextId::SavingScreenshot);
             return;
         }
         const MonitorInfo* monitor = SelectedMonitor();
         if (monitor == nullptr || (RegionMode() && !regionAvailable_)) {
-            SetStatus(L"请先选择有效的截图范围", true);
+            SetStatus(ui::TextId::SelectValidScreenshotArea, true);
             return;
         }
         if (outputDirectory_.empty()) {
-            SetStatus(L"请选择截图保存位置", true);
+            SetStatus(ui::TextId::ChooseScreenshotFolder, true);
             return;
         }
         const RECT source = CurrentSourceRect();
@@ -1756,7 +1891,7 @@ private:
         if (!screenshotWorker_.SubmitCapture(monitor->handle, source, outputDirectory_, &error)) {
             phase_ = Phase::Idle;
             ShowMainWindow();
-            SetStatus(L"截图失败：" + error, true);
+            SetStatus(ui::Format(ui::TextId::ScreenshotFailure, ui::LocalizeMessage(error)), true);
             UpdateUiState();
         } else {
             screenshotFailure_.clear();
@@ -1765,6 +1900,9 @@ private:
 
     void OnCommand(int id, int notification) {
         switch (id) {
+            case kFormatCombo:
+                if (notification == CBN_SELCHANGE) ChangeFormat();
+                break;
             case kLanguageCombo:
                 if (notification == CBN_SELCHANGE) {
                     ui::SetLanguagePreference(static_cast<int>(::SendMessageW(
@@ -1946,11 +2084,11 @@ private:
                         session_->Stop();
                     }
                     if (floating_ != nullptr) {
-                        floating_->SetContent(L"正在保存…", false, L"");
+                        floating_->SetContent(ui::TextId::Saving, false, ui::TextId::Empty);
                     }
                 } else if (screenshotWorker_.pending() != 0) {
                     closingPending_ = true;
-                    SetStatus(L"正在保存截图，完成后退出…");
+                    SetStatus(ui::TextId::SavingScreenshotsBeforeClosing);
                 } else {
                     ::DestroyWindow(window_);
                 }
@@ -2027,6 +2165,8 @@ private:
     HWND qualityLabel_ = nullptr;
     HWND qualityCombo_ = nullptr;
     HWND qualityHint_ = nullptr;
+    HWND formatLabel_ = nullptr;
+    HWND formatCombo_ = nullptr;
     HWND audioCheck_ = nullptr;
     HWND micCheck_ = nullptr;
     HWND systemDeviceCombo_ = nullptr;
@@ -2045,6 +2185,13 @@ private:
     bool regionAvailable_ = false;
     RECT regionRect_{};
     Size customBound_{1920, 1080};
+    RecordingFormat format_ = RecordingFormat::Mp4;
+    ResolutionLimit mp4Limit_ = ResolutionLimit::P1080;
+    Size mp4CustomBound_{1920, 1080};
+    int mp4Fps_ = kDefaultMp4FrameRate;
+    ResolutionLimit gifLimit_ = ResolutionLimit::P720;
+    Size gifCustomBound_{1280, 720};
+    int gifFps_ = kDefaultGifFrameRate;
     int lastResolutionIndex_ = 2;
     bool configValid_ = false;
     std::wstring outputDirectory_;
@@ -2069,7 +2216,7 @@ private:
     bool systemAudioEnabled_ = false;
     bool microphoneEnabled_ = false;
     std::uint64_t audioRevision_ = 0;
-    std::wstring pendingAudioSource_;
+    ui::TextId pendingAudioSource_ = ui::TextId::Empty;
     bool pendingAudioEnabled_ = false;
     ScreenshotWorker screenshotWorker_;
     std::wstring screenshotFailure_;

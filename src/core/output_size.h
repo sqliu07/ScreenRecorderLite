@@ -42,13 +42,13 @@ struct OutputSizeRequest {
     Size customBound{};
 };
 
-// Applies FR-02: fit inside a bound without upscaling, round, then pad odd
+// Fit inside a bound without upscaling, round, then pad odd
 // width/height to even on the right/bottom. Returns std::nullopt and fills
 // `error` when the requested combination is not allowed.
 [[nodiscard]] std::optional<OutputSize> ComputeOutputSize(const OutputSizeRequest& request,
                                                           std::wstring* error = nullptr);
 
-// Bound for a preset. Square sources use the landscape bound (docs/03 4.3).
+// Bound for a preset. Square sources use the landscape bound.
 [[nodiscard]] std::optional<Size> PresetBound(ResolutionLimit limit, bool portrait);
 
 [[nodiscard]] std::wstring_view LimitName(ResolutionLimit limit);

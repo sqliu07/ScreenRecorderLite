@@ -23,6 +23,9 @@
 #include <mutex>
 
 #include "common/win32.h"
+#include "core/recording_format.h"
+#include "platform/displays.h"
+#include "recording/hdr_tone_mapper.h"
 
 namespace srl {
 namespace {
@@ -129,7 +132,7 @@ std::int64_t QpcNow100ns() {
     }
     const std::int64_t whole = counter.QuadPart / frequency;
     const std::int64_t remainder = counter.QuadPart % frequency;
-    return whole * 10'000'000 + remainder * 10'000'000 / frequency;
+    return whole * kHundredNanosecondsPerSecond + remainder * kHundredNanosecondsPerSecond / frequency;
 }
 
 struct ScreenCapture::Impl : std::enable_shared_from_this<ScreenCapture::Impl> {
@@ -153,6 +156,10 @@ struct ScreenCapture::Impl : std::enable_shared_from_this<ScreenCapture::Impl> {
     UINT stagingWidth = 0;
     UINT stagingHeight = 0;
     DXGI_FORMAT stagingFormat = DXGI_FORMAT_UNKNOWN;
+    MonitorInfo colorMonitor;
+    bool floatCapture = false;
+    std::unique_ptr<HdrToneMapper> toneMapper;
+    std::int64_t nextColorCheck100ns = 0;
 
     Capture::Direct3D11CaptureFramePool pool{nullptr};
     Capture::GraphicsCaptureSession session{nullptr};
@@ -208,8 +215,10 @@ struct ScreenCapture::Impl : std::enable_shared_from_this<ScreenCapture::Impl> {
 
             D3D11_TEXTURE2D_DESC desc{};
             texture->GetDesc(&desc);
-            if (desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM) {
-                SetError(L"captured texture is not BGRA8; HDR capture is not supported");
+            const DXGI_FORMAT expected = floatCapture ? DXGI_FORMAT_R16G16B16A16_FLOAT
+                                                       : DXGI_FORMAT_B8G8R8A8_UNORM;
+            if (desc.Format != expected) {
+                SetError(L"captured texture format changed unexpectedly");
                 frame.Close();
                 return;
             }
@@ -233,6 +242,25 @@ struct ScreenCapture::Impl : std::enable_shared_from_this<ScreenCapture::Impl> {
                         frame.Close();
                         return;
                     }
+                }
+                if (now >= nextColorCheck100ns) {
+                    nextColorCheck100ns = now + kHundredNanosecondsPerSecond;
+                    MonitorInfo current = colorMonitor;
+                    if (RefreshDisplayColor(current)) {
+                        const bool needsFloat = IsAdvancedColorActive(current) || !current.colorInfoAvailable;
+                        if (needsFloat != floatCapture || current.hdrEnabled != colorMonitor.hdrEnabled) {
+                            SetError(L"display color mode changed; start a new recording");
+                            frame.Close();
+                            return;
+                        }
+                        colorMonitor = std::move(current);
+                    }
+                }
+                if (toneMapper) {
+                    texture = toneMapper->Convert(texture.Get(),
+                        colorMonitor.hdrEnabled ? colorMonitor.sdrWhiteScale : 1.0f,
+                        colorMonitor.hdrEnabled);
+                    texture->GetDesc(&desc);
                 }
                 if (staging == nullptr || stagingWidth != desc.Width ||
                     stagingHeight != desc.Height || stagingFormat != desc.Format) {
@@ -308,7 +336,7 @@ bool ScreenCapture::Start(HMONITOR monitor, int fps, std::wstring* error) {
         return false;
     }
     impl_->fps = std::max(1, fps);
-    impl_->minInterval100ns = 10'000'000 / impl_->fps;
+    impl_->minInterval100ns = kHundredNanosecondsPerSecond / impl_->fps;
 
     const auto fail = [this, error](std::wstring message) {
         if (error != nullptr) {
@@ -329,6 +357,13 @@ bool ScreenCapture::Start(HMONITOR monitor, int fps, std::wstring* error) {
     }
 
     try {
+        const auto displays = EnumerateDisplays();
+        const auto selected = std::find_if(displays.begin(), displays.end(),
+            [monitor](const MonitorInfo& display) { return display.handle == monitor; });
+        if (selected == displays.end()) return fail(L"selected display is unavailable");
+        impl_->colorMonitor = *selected;
+        impl_->floatCapture = IsAdvancedColorActive(*selected) || !selected->colorInfoAvailable;
+        impl_->nextColorCheck100ns = QpcNow100ns() + kHundredNanosecondsPerSecond;
         ComPtr<IDXGIAdapter1> adapter = FindAdapterForMonitor(monitor);
         const D3D_DRIVER_TYPE driverType =
             adapter != nullptr ? D3D_DRIVER_TYPE_UNKNOWN : D3D_DRIVER_TYPE_HARDWARE;
@@ -341,6 +376,9 @@ bool ScreenCapture::Start(HMONITOR monitor, int fps, std::wstring* error) {
             return fail(Utf8ToWide(std::format("D3D11CreateDevice failed: {}",
                                                HResultText(hr))));
         }
+
+        if (impl_->floatCapture)
+            impl_->toneMapper = std::make_unique<HdrToneMapper>(impl_->device.Get(), impl_->context.Get());
 
         ComPtr<IDXGIDevice> dxgiDevice;
         CheckHResult(impl_->device.As(&dxgiDevice), "QueryInterface(IDXGIDevice)");
@@ -366,7 +404,9 @@ bool ScreenCapture::Start(HMONITOR monitor, int fps, std::wstring* error) {
         impl_->frameSize = Size{itemSize.Width, itemSize.Height};
 
         impl_->pool = Capture::Direct3D11CaptureFramePool::CreateFreeThreaded(
-            winrtDevice, DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized, 2, itemSize);
+            winrtDevice, impl_->floatCapture ? DirectX::DirectXPixelFormat::R16G16B16A16Float
+                                            : DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized,
+            2, itemSize);
         impl_->session = impl_->pool.CreateCaptureSession(impl_->item);
         try {
             impl_->session.IsCursorCaptureEnabled(true);

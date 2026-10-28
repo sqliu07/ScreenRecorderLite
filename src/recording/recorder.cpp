@@ -3,6 +3,7 @@
 #include <mfapi.h>
 #include <mfidl.h>
 #include <mfreadwrite.h>
+#include <shlwapi.h>
 #include <wrl/client.h>
 #include <winrt/base.h>
 
@@ -13,6 +14,7 @@
 #include <deque>
 #include <filesystem>
 #include <format>
+#include <limits>
 #include <optional>
 #include <thread>
 #include <utility>
@@ -20,7 +22,9 @@
 
 #include "common/win32.h"
 #include "core/bgra_to_nv12.h"
+#include "core/recording_format.h"
 #include "core/storage.h"
+#include "image/gif_writer.h"
 #include "media/mf_util.h"
 #include "media/mp4_muxer.h"
 #include "platform/displays.h"
@@ -32,9 +36,32 @@ namespace {
 
 using Microsoft::WRL::ComPtr;
 
-constexpr std::int64_t kTicksPerSecond = 10'000'000;
-constexpr std::uint32_t kAudioRate = 48'000;
-constexpr std::uint32_t kAudioChannels = 2;
+constexpr unsigned kSystemSourceBit = 1U;
+constexpr unsigned kMicrophoneSourceBit = 2U;
+constexpr std::size_t kSeparateAudioTrackCount = kAudioTrackCount - 1;
+constexpr std::size_t kMaximumAudioTransitions = 64;
+constexpr int kOutputFilenameAttempts = 1'000;
+constexpr DWORD kFirstFrameTimeoutMs = 3'000;
+constexpr DWORD kCapturePollIntervalMs = 2;
+constexpr std::int64_t kStorageCheckInterval = 2 * kHundredNanosecondsPerSecond;
+constexpr std::int64_t kAudioChunkFrames = kAudioOutputRate / 10;  // 100 ms
+constexpr std::int64_t kAudioMixDelayFrames = kAudioOutputRate / 10;  // 100 ms
+constexpr std::int64_t kAudioCatchUpFrames = kAudioOutputRate / 2;  // 500 ms
+constexpr float kAudioLimiterCeiling = 30'000.0f;
+constexpr float kAudioLimiterReleaseSeconds = 0.15f;
+constexpr UINT32 kAacProfileLevelIndication = 0x29;
+constexpr float kPcmMinimum = static_cast<float>(std::numeric_limits<std::int16_t>::min());
+constexpr float kPcmMaximum = static_cast<float>(std::numeric_limits<std::int16_t>::max());
+constexpr std::uint64_t kGifMaximumBytesPerPixel = 2;
+constexpr std::uint64_t kGifStorageHeadroomSeconds = 3;
+constexpr std::uint64_t kGifStopSpaceFloor = 128 * kMiB;
+constexpr std::uint64_t kGifStartSpaceFloor = 512 * kMiB;
+
+std::uint64_t GifStopSpace(Size size, int fps) {
+    return std::max(kGifStopSpaceFloor,
+        static_cast<std::uint64_t>(size.width) * size.height * fps *
+            kGifMaximumBytesPerPixel * kGifStorageHeadroomSeconds);
+}
 
 struct QueuedAudioPacket {
     std::int64_t start = 0;
@@ -56,7 +83,7 @@ struct PendingAudioOpen {
     std::int64_t readyQpc = 0;
 };
 
-std::array<std::atomic<bool>, 2> g_audioOpenInFlight{};
+std::array<std::atomic<bool>, kSeparateAudioTrackCount> g_audioOpenInFlight{};
 
 struct LiveAudioState {
     unsigned currentMask = 0;
@@ -64,7 +91,6 @@ struct LiveAudioState {
     unsigned baseMask = 0;
     std::int64_t zeroQpc = 0;
     std::int64_t mixedThroughSample = 0;
-    std::int64_t requestQpc = 0;
     std::deque<std::pair<std::int64_t, unsigned>> transitions;
 };
 
@@ -131,12 +157,12 @@ ComPtr<IMFMediaType> CreateAudioTargetType() {
     }
     type->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
     type->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_AAC);
-    type->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, kAudioRate);
-    type->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, kAudioChannels);
-    type->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, 16);
-    type->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, 16'000);
+    type->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, kAudioOutputRate);
+    type->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, kAudioOutputChannels);
+    type->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, kAudioPcmBitsPerSample);
+    type->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, kAudioEncodedBytesPerSecond);
     type->SetUINT32(MF_MT_AAC_PAYLOAD_TYPE, 0);
-    type->SetUINT32(MF_MT_AAC_AUDIO_PROFILE_LEVEL_INDICATION, 0x29);
+    type->SetUINT32(MF_MT_AAC_AUDIO_PROFILE_LEVEL_INDICATION, kAacProfileLevelIndication);
     return type;
 }
 
@@ -147,11 +173,11 @@ ComPtr<IMFMediaType> CreateAudioInputType() {
     }
     type->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
     type->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_PCM);
-    type->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, kAudioRate);
-    type->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, kAudioChannels);
-    type->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, 16);
-    type->SetUINT32(MF_MT_AUDIO_BLOCK_ALIGNMENT, kAudioChannels * 2);
-    type->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, kAudioRate * kAudioChannels * 2);
+    type->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, kAudioOutputRate);
+    type->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, kAudioOutputChannels);
+    type->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, kAudioPcmBitsPerSample);
+    type->SetUINT32(MF_MT_AUDIO_BLOCK_ALIGNMENT, kAudioPcmBlockAlignment);
+    type->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, kAudioPcmBytesPerSecond);
     return type;
 }
 
@@ -277,12 +303,25 @@ bool WriteTestFile(const std::filesystem::path& directory, std::wstring* error) 
 
 std::int64_t RelativeSample(std::int64_t qpc, std::int64_t zero) {
     const std::int64_t relative = qpc - zero;
-    return relative * static_cast<std::int64_t>(kAudioRate) / kTicksPerSecond;
+    return relative * static_cast<std::int64_t>(kAudioOutputRate) / kHundredNanosecondsPerSecond;
 }
 
 }  // namespace
 
 namespace detail {
+
+std::int64_t AdvanceVideoFrameIndex(std::int64_t nextIndex, int fps,
+                                    std::int64_t elapsed100ns) {
+    const auto elapsed = std::max<std::int64_t>(0, elapsed100ns);
+    const auto currentIndex = (elapsed / kHundredNanosecondsPerSecond) * fps +
+        (elapsed % kHundredNanosecondsPerSecond) * fps / kHundredNanosecondsPerSecond;
+    return std::max(nextIndex, currentIndex);
+}
+
+std::int64_t VideoFrameTimestamp(std::int64_t frameIndex, int fps) {
+    return (frameIndex / fps) * kHundredNanosecondsPerSecond +
+        (frameIndex % fps) * kHundredNanosecondsPerSecond / fps;
+}
 
 void AddAudioPacket(const std::vector<std::int16_t>& samples,
                     std::int64_t packetStart, std::int64_t blockStart,
@@ -291,32 +330,31 @@ void AddAudioPacket(const std::vector<std::int16_t>& samples,
     if (gain <= 0.0f || blockEnd <= blockStart) {
         return;
     }
-    const auto frames = static_cast<std::int64_t>(samples.size() / kAudioChannels);
+    const auto frames = static_cast<std::int64_t>(samples.size() / kAudioOutputChannels);
     const auto from = std::max({blockStart, packetStart, enabledFrom});
     const auto to = std::min(blockEnd, packetStart + frames);
     if (to <= from) {
         return;
     }
-    const auto sourceOffset = (from - packetStart) * kAudioChannels;
-    const auto destinationOffset = (from - blockStart) * kAudioChannels;
-    const auto count = (to - from) * kAudioChannels;
+    const auto sourceOffset = (from - packetStart) * kAudioOutputChannels;
+    const auto destinationOffset = (from - blockStart) * kAudioOutputChannels;
+    const auto count = (to - from) * kAudioOutputChannels;
     for (std::int64_t i = 0; i < count; ++i) {
         mix[static_cast<std::size_t>(destinationOffset + i)] +=
             static_cast<float>(samples[static_cast<std::size_t>(sourceOffset + i)]) * gain;
     }
 }
 
-void MixAudioPacketTimeline(const std::vector<std::int16_t>& samples,
-                            std::int64_t packetStart, std::int64_t blockStart,
-                            std::int64_t blockEnd, unsigned sourceBit,
-                            unsigned initialMask,
-                            const std::vector<std::pair<std::int64_t, unsigned>>& transitions,
-                            std::vector<float>& mix, float overlapGain) {
+void MixAudioPacketTimelineFullLevel(
+    const std::vector<std::int16_t>& samples, std::int64_t packetStart,
+    std::int64_t blockStart, std::int64_t blockEnd, unsigned sourceBit,
+    unsigned initialMask,
+    const std::vector<std::pair<std::int64_t, unsigned>>& transitions,
+    std::vector<float>& mix) {
     auto cursor = blockStart;
     auto mask = initialMask;
     const auto addSegment = [&](std::int64_t end) {
-        const float gain = (mask & sourceBit) == 0 ? 0.0f
-                            : (mask & 3U) == 3U ? overlapGain : 1.0f;
+        const float gain = (mask & sourceBit) != 0 ? 1.0f : 0.0f;
         AddAudioPacket(samples, packetStart, blockStart, end, cursor, gain, mix);
         cursor = end;
     };
@@ -334,26 +372,6 @@ void MixAudioPacketTimeline(const std::vector<std::int16_t>& samples,
     addSegment(blockEnd);
 }
 
-void MixAudioPacketTimeline(const std::vector<std::int16_t>& samples,
-                            std::int64_t packetStart, std::int64_t blockStart,
-                            std::int64_t blockEnd, unsigned sourceBit,
-                            unsigned initialMask,
-                            const std::vector<std::pair<std::int64_t, unsigned>>& transitions,
-                            std::vector<float>& mix) {
-    MixAudioPacketTimeline(samples, packetStart, blockStart, blockEnd, sourceBit,
-                           initialMask, transitions, mix, 0.5f);
-}
-
-void MixAudioPacketTimelineFullLevel(
-    const std::vector<std::int16_t>& samples, std::int64_t packetStart,
-    std::int64_t blockStart, std::int64_t blockEnd, unsigned sourceBit,
-    unsigned initialMask,
-    const std::vector<std::pair<std::int64_t, unsigned>>& transitions,
-    std::vector<float>& mix) {
-    MixAudioPacketTimeline(samples, packetStart, blockStart, blockEnd, sourceBit,
-                           initialMask, transitions, mix, 1.0f);
-}
-
 bool AppendAudioTransition(std::deque<std::pair<std::int64_t, unsigned>>& transitions,
                             std::int64_t qpc, unsigned mask) {
     if (!transitions.empty()) {
@@ -365,31 +383,32 @@ bool AppendAudioTransition(std::deque<std::pair<std::int64_t, unsigned>>& transi
             return true;
         }
     }
-    constexpr std::size_t kMaximumTransitions = 64;
-    if (transitions.size() >= kMaximumTransitions) {
+    if (transitions.size() >= kMaximumAudioTransitions) {
         return false;
     }
     transitions.emplace_back(qpc, mask);
     return true;
 }
 
-// The stream is created atomically and remains open while SinkWriter uses it.
+// The stream is created atomically and remains open while the encoder uses it.
 // Never reopen a path selected by an earlier exists() check for writing.
 bool CreateRecordingOutputFile(const std::filesystem::path& directory,
                                const std::wstring& base, std::wstring& finalPath,
-                               std::wstring& partialPath, IMFByteStream** stream,
-                               std::wstring* error) {
+                               std::wstring& partialPath, IStream** stream,
+                               std::wstring* error,
+                               RecordingFormat format = RecordingFormat::Mp4) {
     finalPath.clear();
     partialPath.clear();
     if (stream == nullptr) {
         return false;
     }
     *stream = nullptr;
-    for (int attempt = 0; attempt < 1000; ++attempt) {
+    for (int attempt = 0; attempt < kOutputFilenameAttempts; ++attempt) {
         const std::wstring stem =
             base + (attempt == 0 ? L"" : L"_" + std::to_wstring(attempt));
-        const std::filesystem::path finalCandidate = directory / (stem + L".mp4");
-        const std::filesystem::path partialCandidate = directory / (stem + L"_partial.mp4");
+        const std::wstring extension(RecordingExtension(format));
+        const std::filesystem::path finalCandidate = directory / (stem + extension);
+        const std::filesystem::path partialCandidate = directory / (stem + L"_partial" + extension);
         if (::GetFileAttributesW(finalCandidate.c_str()) != INVALID_FILE_ATTRIBUTES) {
             continue;
         }
@@ -400,24 +419,52 @@ bool CreateRecordingOutputFile(const std::filesystem::path& directory,
             }
             return false;
         }
-        const HRESULT hr = ::MFCreateFile(MF_ACCESSMODE_READWRITE, MF_OPENMODE_FAIL_IF_EXIST,
-                                           MF_FILEFLAGS_NONE, partialCandidate.c_str(), stream);
+        const HRESULT hr = ::SHCreateStreamOnFileEx(partialCandidate.c_str(),
+            STGM_READWRITE | STGM_SHARE_EXCLUSIVE | STGM_FAILIFTHERE,
+            FILE_ATTRIBUTE_NORMAL, TRUE, nullptr, stream);
         if (SUCCEEDED(hr)) {
             finalPath = finalCandidate.wstring();
             partialPath = partialCandidate.wstring();
             return true;
         }
-        if (hr != HRESULT_FROM_WIN32(ERROR_FILE_EXISTS) &&
+        if (hr != STG_E_FILEALREADYEXISTS &&
+            hr != HRESULT_FROM_WIN32(ERROR_FILE_EXISTS) &&
             hr != HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS) &&
             hr != HRESULT_FROM_WIN32(ERROR_SHARING_VIOLATION)) {
             if (error != nullptr) {
-                *error = L"无法创建 MP4 临时文件：" + HrTextWide(hr);
+                *error = L"无法创建录制临时文件：" + HrTextWide(hr);
             }
             return false;
         }
     }
     if (error != nullptr) {
         *error = L"无法生成不重复的输出文件名";
+    }
+    return false;
+}
+
+void CleanupRecordingAudioFile(const std::wstring& ownedPath, bool preserve,
+                                std::vector<std::wstring>& recoveryPaths) {
+    if (ownedPath.empty()) return;
+    const DWORD attributes = ::GetFileAttributesW(ownedPath.c_str());
+    if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+        return;
+    }
+    if (preserve) {
+        recoveryPaths.push_back(ownedPath);
+    } else {
+        ::DeleteFileW(ownedPath.c_str());
+    }
+}
+
+bool CommitRecordingOutputFile(const std::wstring& partialPath,
+                                const std::wstring& finalPath, std::wstring* error) {
+    if (::MoveFileExW(partialPath.c_str(), finalPath.c_str(), MOVEFILE_WRITE_THROUGH)) {
+        return true;
+    }
+    if (error != nullptr) {
+        *error = L"无法保存最终录制文件：" +
+            HrTextWide(HRESULT_FROM_WIN32(::GetLastError()));
     }
     return false;
 }
@@ -482,13 +529,18 @@ bool RecordingSession::Impl::Prepare(std::wstring* error) {
         return false;
     };
 
-    if (!CheckMp4MuxerAvailable(error)) return false;
-
-    if (config.fps != 30 && config.fps != 60) {
-        return fail(L"帧率只支持 30 或 60");
+    const bool isGif = config.format == RecordingFormat::Gif;
+    if (!IsFrameRateSupported(config.format, config.fps)) {
+        return fail(isGif ? L"GIF 帧率只支持 10、15、20 或 25"
+                          : L"MP4 帧率只支持 30 或 60");
     }
-    if (config.bitrateMbps < 1 || config.bitrateMbps > 50) {
+    if (!isGif && !CheckMp4MuxerAvailable(error)) return false;
+    if (!isGif && (config.bitrateMbps < 1 || config.bitrateMbps > 50)) {
         return fail(L"视频码率需在 1～50 Mbps 之间");
+    }
+    if (isGif) {
+        config.systemAudio = false;
+        config.microphone = false;
     }
     if (config.outputDirectory.empty()) {
         return fail(L"请选择导出目录");
@@ -496,7 +548,7 @@ bool RecordingSession::Impl::Prepare(std::wstring* error) {
 
     const int sourceWidth = config.sourceRect.right - config.sourceRect.left;
     const int sourceHeight = config.sourceRect.bottom - config.sourceRect.top;
-    if (sourceWidth < 64 || sourceHeight < 64) {
+    if (sourceWidth < kMinOutputDimension || sourceHeight < kMinOutputDimension) {
         return fail(L"录制区域至少需要 64×64 物理像素");
     }
 
@@ -518,9 +570,6 @@ bool RecordingSession::Impl::Prepare(std::wstring* error) {
     }
     if (monitor == nullptr) {
         return fail(L"找不到所选显示器，可能已断开");
-    }
-    if (IsAdvancedColorActive(*monitor)) {
-        return fail(L"目标显示器已启用 HDR/高级色彩。首版只支持 SDR，请切换到 SDR 后重试。");
     }
     const int monitorWidth = monitor->virtualRect.right - monitor->virtualRect.left;
     const int monitorHeight = monitor->virtualRect.bottom - monitor->virtualRect.top;
@@ -559,8 +608,10 @@ bool RecordingSession::Impl::Prepare(std::wstring* error) {
         return false;
     }
 
-    const std::uint64_t required = StartSpaceRequirementWithAudioTracks(
-        MbpsToBitsPerSecond(static_cast<double>(config.bitrateMbps)), 3);
+    const std::uint64_t required = isGif
+        ? std::max(kGifStartSpaceFloor, GifStopSpace(outputInfo.output, config.fps) + kGifStopSpaceFloor)
+        : StartSpaceRequirementWithAudioTracks(
+            MbpsToBitsPerSecond(static_cast<double>(config.bitrateMbps)), kAudioTrackCount);
     return detail::CheckRecordingStorage(config.outputDirectory, required, error);
 }
 
@@ -574,17 +625,28 @@ bool RecordingSession::Impl::OpenWriter(bool hardware, ComPtr<IMFSinkWriter>& wr
     if (outputFile != nullptr) {
         outputFile->Close();
         outputFile.Reset();
-        // Only a successful exclusive create assigns partialPath.
-        ::DeleteFileW(partialPath.c_str());
     }
+    // Only a successful exclusive create assigns partialPath. OpenWriter is
+    // called only before recording, including a hardware-to-software retry.
+    if (!partialPath.empty()) {
+        ::DeleteFileW(partialPath.c_str());
+        partialPath.clear();
+    }
+    ComPtr<IStream> reservedFile;
     if (!detail::CreateRecordingOutputFile(config.outputDirectory,
             L"Recording_" + CurrentTimestampForFileName(), finalPath, partialPath,
-            outputFile.GetAddressOf(), &error)) {
+            reservedFile.GetAddressOf(), &error)) {
+        return false;
+    }
+
+    HRESULT hr = ::MFCreateMFByteStreamOnStream(reservedFile.Get(), outputFile.GetAddressOf());
+    if (FAILED(hr)) {
+        error = L"无法准备录制文件流：" + HrTextWide(hr);
         return false;
     }
 
     ComPtr<IMFAttributes> attributes;
-    HRESULT hr = ::MFCreateAttributes(attributes.GetAddressOf(), 1);
+    hr = ::MFCreateAttributes(attributes.GetAddressOf(), 1);
     if (FAILED(hr)) {
         error = L"创建 SinkWriter 属性失败：" + HrTextWide(hr);
         return false;
@@ -654,25 +716,27 @@ bool RecordingSession::Impl::OpenWriter(bool hardware, ComPtr<IMFSinkWriter>& wr
 
 void RecordingSession::Impl::Run() {
     state.store(RecorderState::Starting, std::memory_order_release);
+    const bool isGif = config.format == RecordingFormat::Gif;
 
     bool apartmentInitialized = false;
     bool mfStarted = false;
     bool failure = false;
     std::wstring failureMessage;
-    bool cleanStop = false;
     std::int64_t zeroQpc = 0;
     std::int64_t stopElapsed = -1;
     int videoFrames = 0;
     int audioChunks = 0;
     std::int64_t audioSamplesWritten = 0;
     float audioLimiterGain = 1.0f;
-    std::array<AudioOnlyWriter, 2> sourceAudioWriters;
-    std::array<std::int64_t, 2> sourceAudioSamplesWritten{};
-    std::array<std::wstring, 2> sourceAudioPaths;
+    std::array<AudioOnlyWriter, kSeparateAudioTrackCount> sourceAudioWriters;
+    std::array<std::int64_t, kSeparateAudioTrackCount> sourceAudioSamplesWritten{};
+    std::array<std::wstring, kSeparateAudioTrackCount> sourceAudioPaths;
     std::wstring encoderInfo;
 
     ComPtr<IMFSinkWriter> writer;
     ComPtr<IMFByteStream> outputFile;
+    ComPtr<IStream> gifOutputFile;
+    GifWriter gifWriter;
     DWORD videoStream = 0;
     DWORD audioStream = 0;
     std::shared_ptr<ScreenCapture> capture;
@@ -691,9 +755,15 @@ void RecordingSession::Impl::Run() {
     std::vector<std::uint8_t> latestBgra;
     std::vector<std::uint8_t> nv12;
     bool haveFrame = false;
+    Size capturedSize{};
+    std::wstring frameWriteError;
 
     const auto writeVideoSample = [&](std::int64_t timestamp,
                                       std::int64_t duration) -> bool {
+        if (isGif) {
+            return gifWriter.WriteFrame(latestBgra, capturedSize.width,
+                capturedSize.height, timestamp, &frameWriteError);
+        }
         if (writer == nullptr || nv12.empty()) {
             return false;
         }
@@ -722,7 +792,7 @@ void RecordingSession::Impl::Run() {
         return SUCCEEDED(hr);
     };
 
-    static const std::vector<std::int16_t> kSilence(4800 * kAudioChannels, 0);
+    static const std::vector<std::int16_t> kSilence(kAudioChunkFrames * kAudioOutputChannels, 0);
 
     const auto writePcmTo = [&](IMFSinkWriter* targetWriter, DWORD targetStream,
                                 std::int64_t& writtenSamples,
@@ -734,10 +804,10 @@ void RecordingSession::Impl::Run() {
         }
         std::int64_t offset = 0;
         while (offset < frames) {
-            const std::int64_t chunk = std::min<std::int64_t>(4800, frames - offset);
+            const std::int64_t chunk = std::min<std::int64_t>(kAudioChunkFrames, frames - offset);
             ComPtr<IMFMediaBuffer> buffer;
             HRESULT hr = ::MFCreateMemoryBuffer(
-                static_cast<DWORD>(chunk * kAudioChannels * sizeof(std::int16_t)),
+                static_cast<DWORD>(chunk * kAudioPcmBlockAlignment),
                 buffer.GetAddressOf());
             if (FAILED(hr)) {
                 return false;
@@ -746,12 +816,11 @@ void RecordingSession::Impl::Run() {
             if (FAILED(buffer->Lock(&destination, nullptr, nullptr))) {
                 return false;
             }
-            std::memcpy(destination, data + offset * kAudioChannels,
-                        static_cast<std::size_t>(chunk) * kAudioChannels *
-                            sizeof(std::int16_t));
+            std::memcpy(destination, data + offset * kAudioOutputChannels,
+                        static_cast<std::size_t>(chunk) * kAudioPcmBlockAlignment);
             buffer->Unlock();
             buffer->SetCurrentLength(static_cast<DWORD>(
-                chunk * kAudioChannels * sizeof(std::int16_t)));
+                chunk * kAudioPcmBlockAlignment));
 
             ComPtr<IMFSample> sample;
             if (FAILED(::MFCreateSample(sample.GetAddressOf())) ||
@@ -759,8 +828,8 @@ void RecordingSession::Impl::Run() {
                 return false;
             }
             const std::int64_t timestamp =
-                writtenSamples * kTicksPerSecond / kAudioRate;
-            const std::int64_t duration = chunk * kTicksPerSecond / kAudioRate;
+                writtenSamples * kHundredNanosecondsPerSecond / kAudioOutputRate;
+            const std::int64_t duration = chunk * kHundredNanosecondsPerSecond / kAudioOutputRate;
             sample->SetSampleTime(timestamp);
             sample->SetSampleDuration(duration);
             hr = targetWriter->WriteSample(targetStream, sample.Get());
@@ -789,7 +858,7 @@ void RecordingSession::Impl::Run() {
     const auto padSilenceTo = [&](std::int64_t targetSample) -> bool {
         while (audioSamplesWritten < targetSample) {
             const std::int64_t frames =
-                std::min<std::int64_t>(4800, targetSample - audioSamplesWritten);
+                std::min<std::int64_t>(kAudioChunkFrames, targetSample - audioSamplesWritten);
             if (!writePcm(kSilence.data(), frames)) {
                 return false;
             }
@@ -824,7 +893,7 @@ void RecordingSession::Impl::Run() {
         AudioPacket packet;
         while (source.capture->TryPop(packet)) {
             const std::int64_t frames =
-                static_cast<std::int64_t>(packet.samples.size() / kAudioChannels);
+                static_cast<std::int64_t>(packet.samples.size() / kAudioOutputChannels);
             if (frames <= 0) {
                 continue;
             }
@@ -860,7 +929,7 @@ void RecordingSession::Impl::Run() {
             readyCapture->Join();
             std::lock_guard lock(slot->mutex);
             slot->capture.reset();
-            g_audioOpenInFlight[slot->sourceBit == 1U ? 0U : 1U].store(
+            g_audioOpenInFlight[slot->sourceBit == kSystemSourceBit ? 0U : 1U].store(
                 false, std::memory_order_release);
         }
     };
@@ -878,19 +947,17 @@ void RecordingSession::Impl::Run() {
             return;
         }
         unsigned requestedMask = 0;
-        std::int64_t requestQpc = 0;
         {
             std::lock_guard lock(audioControlMutex);
             if (!audioStatus.pending) return;
             requestedMask = liveAudio.requestedMask;
-            requestQpc = liveAudio.requestQpc;
         }
         const auto failRequest = [&](std::wstring message) {
             cancelPendingAudioOpen();
             std::lock_guard lock(audioControlMutex);
             liveAudio.requestedMask = liveAudio.currentMask;
-            audioStatus.systemAudio = (liveAudio.currentMask & 1U) != 0;
-            audioStatus.microphone = (liveAudio.currentMask & 2U) != 0;
+            audioStatus.systemAudio = (liveAudio.currentMask & kSystemSourceBit) != 0;
+            audioStatus.microphone = (liveAudio.currentMask & kMicrophoneSourceBit) != 0;
             audioStatus.pending = false;
             audioStatus.error = std::move(message);
             ++audioStatus.revision;
@@ -921,13 +988,13 @@ void RecordingSession::Impl::Run() {
                     opened->Join();
                 }
                 failRequest(openError.empty()
-                    ? (sourceBit == 1U ? L"无法开启系统声音" : L"无法开启麦克风")
+                    ? (sourceBit == kSystemSourceBit ? L"无法开启系统声音" : L"无法开启麦克风")
                     : std::move(openError));
                 return;
             }
-            LocalAudioSource& source = sourceBit == 1U ? systemAudioSource : microphoneSource;
+            LocalAudioSource& source = sourceBit == kSystemSourceBit ? systemAudioSource : microphoneSource;
             source.capture = std::move(opened);
-            const std::size_t sourceIndex = sourceBit == 1U ? 0U : 1U;
+            const std::size_t sourceIndex = sourceBit == kSystemSourceBit ? 0U : 1U;
             g_audioOpenInFlight[sourceIndex].store(false, std::memory_order_release);
 
             unsigned nextMask = 0;
@@ -940,8 +1007,8 @@ void RecordingSession::Impl::Run() {
                     nextMask = liveAudio.currentMask;
                 } else {
                     liveAudio.currentMask = nextMask;
-                    audioStatus.systemAudio = (nextMask & 1U) != 0;
-                    audioStatus.microphone = (nextMask & 2U) != 0;
+                    audioStatus.systemAudio = (nextMask & kSystemSourceBit) != 0;
+                    audioStatus.microphone = (nextMask & kMicrophoneSourceBit) != 0;
                     ++audioStatus.revision;
                 }
             }
@@ -959,9 +1026,10 @@ void RecordingSession::Impl::Run() {
         }
         const unsigned missingMask = requestedMask & ~currentMask;
         if (missingMask != 0) {
-            const unsigned sourceBit = (missingMask & 1U) != 0 ? 1U : 2U;
-            const std::size_t sourceIndex = sourceBit == 1U ? 0U : 1U;
-            const std::wstring& deviceId = sourceBit == 1U
+            const unsigned sourceBit = (missingMask & kSystemSourceBit) != 0
+                ? kSystemSourceBit : kMicrophoneSourceBit;
+            const std::size_t sourceIndex = sourceBit == kSystemSourceBit ? 0U : 1U;
+            const std::wstring& deviceId = sourceBit == kSystemSourceBit
                 ? config.systemAudioDeviceId : config.microphoneDeviceId;
             bool expected = false;
             if (!g_audioOpenInFlight[sourceIndex].compare_exchange_strong(
@@ -984,7 +1052,7 @@ void RecordingSession::Impl::Run() {
                     } else if (!slot->cancelled.load(std::memory_order_acquire)) {
                         try {
                             capture = std::make_shared<AudioCapture>(
-                                sourceBit == 1U ? AudioSource::SystemLoopback
+                                sourceBit == kSystemSourceBit ? AudioSource::SystemLoopback
                                                 : AudioSource::Microphone,
                                 deviceId);
                             if (!capture->Start(&error)) {
@@ -1022,7 +1090,7 @@ void RecordingSession::Impl::Run() {
                         capture.reset();
                     }
                     if (!publishedCapture) {
-                        g_audioOpenInFlight[sourceBit == 1U ? 0U : 1U].store(
+                        g_audioOpenInFlight[sourceBit == kSystemSourceBit ? 0U : 1U].store(
                             false, std::memory_order_release);
                     }
                     slot.reset();
@@ -1045,10 +1113,10 @@ void RecordingSession::Impl::Run() {
                 failRequest(L"声音切换超过了当前音频时间轴，请重试");
                 return;
             }
-            if ((currentMask & 1U) != 0 && (requestedMask & 1U) == 0) {
+            if ((currentMask & kSystemSourceBit) != 0 && (requestedMask & kSystemSourceBit) == 0) {
                 closeSource(systemAudioSource);
             }
-            if ((currentMask & 2U) != 0 && (requestedMask & 2U) == 0) {
+            if ((currentMask & kMicrophoneSourceBit) != 0 && (requestedMask & kMicrophoneSourceBit) == 0) {
                 closeSource(microphoneSource);
             }
             currentMask = requestedMask;
@@ -1057,13 +1125,12 @@ void RecordingSession::Impl::Run() {
             std::lock_guard lock(audioControlMutex);
             liveAudio.currentMask = currentMask;
             liveAudio.requestedMask = currentMask;
-            audioStatus.systemAudio = (currentMask & 1U) != 0;
-            audioStatus.microphone = (currentMask & 2U) != 0;
+            audioStatus.systemAudio = (currentMask & kSystemSourceBit) != 0;
+            audioStatus.microphone = (currentMask & kMicrophoneSourceBit) != 0;
             audioStatus.pending = false;
             audioStatus.error.clear();
             ++audioStatus.revision;
         }
-        (void)requestQpc;
     };
 
     const auto audioNeedsAttention = [&] {
@@ -1101,10 +1168,10 @@ void RecordingSession::Impl::Run() {
             const std::int64_t now =
                 std::max<std::int64_t>(0, QpcNow100ns() - zeroQpc);
             const std::int64_t wallSample =
-                now * static_cast<std::int64_t>(kAudioRate) / kTicksPerSecond;
-            target = std::max<std::int64_t>(0, wallSample - kAudioRate / 10);
+                now * static_cast<std::int64_t>(kAudioOutputRate) / kHundredNanosecondsPerSecond;
+            target = std::max<std::int64_t>(0, wallSample - kAudioMixDelayFrames);
             // Do not let one slow video iteration produce a huge burst.
-            target = std::min(target, audioSamplesWritten + kAudioRate / 2);
+            target = std::min(target, audioSamplesWritten + kAudioCatchUpFrames);
         }
         if (target <= audioSamplesWritten) {
             return true;
@@ -1112,12 +1179,12 @@ void RecordingSession::Impl::Run() {
 
         while (audioSamplesWritten < target) {
             const std::int64_t frames =
-                std::min<std::int64_t>(4800, target - audioSamplesWritten);
+                std::min<std::int64_t>(kAudioChunkFrames, target - audioSamplesWritten);
             const std::int64_t blockStart = audioSamplesWritten;
             const std::int64_t blockEnd = blockStart + frames;
             const std::size_t blockSampleCount =
-                static_cast<std::size_t>(frames) * kAudioChannels;
-            std::array<std::vector<float>, 2> sourceMix{
+                static_cast<std::size_t>(frames) * kAudioOutputChannels;
+            std::array<std::vector<float>, kSeparateAudioTrackCount> sourceMix{
                 std::vector<float>(blockSampleCount, 0.0f),
                 std::vector<float>(blockSampleCount, 0.0f)};
 
@@ -1143,7 +1210,7 @@ void RecordingSession::Impl::Run() {
                     const QueuedAudioPacket& front = source.packets.front();
                     const std::int64_t end =
                         front.start +
-                        static_cast<std::int64_t>(front.samples.size() / kAudioChannels);
+                        static_cast<std::int64_t>(front.samples.size() / kAudioOutputChannels);
                     if (end <= blockStart) {
                         source.packets.pop_front();
                         continue;
@@ -1159,8 +1226,8 @@ void RecordingSession::Impl::Run() {
                         sourceBit, initialMask, transitions, trackMix);
                 }
             };
-            addSource(systemAudioSource, 1U, sourceMix[0]);
-            addSource(microphoneSource, 2U, sourceMix[1]);
+            addSource(systemAudioSource, kSystemSourceBit, sourceMix[0]);
+            addSource(microphoneSource, kMicrophoneSourceBit, sourceMix[1]);
 
             std::vector<float> mix(blockSampleCount, 0.0f);
             for (std::size_t i = 0; i < blockSampleCount; ++i) {
@@ -1171,26 +1238,25 @@ void RecordingSession::Impl::Run() {
             for (const float sample : mix) {
                 peak = std::max(peak, std::abs(sample));
             }
-            constexpr float kLimiterCeiling = 30'000.0f;
-            const float targetGain = peak > kLimiterCeiling
-                ? kLimiterCeiling / peak : 1.0f;
+            const float targetGain = peak > kAudioLimiterCeiling
+                ? kAudioLimiterCeiling / peak : 1.0f;
             if (targetGain < audioLimiterGain) {
                 audioLimiterGain = targetGain;
             } else {
                 const float release = std::exp(-static_cast<float>(frames) /
-                    (static_cast<float>(kAudioRate) * 0.15f));
+                    (static_cast<float>(kAudioOutputRate) * kAudioLimiterReleaseSeconds));
                 audioLimiterGain = 1.0f - (1.0f - audioLimiterGain) * release;
             }
 
             std::vector<std::int16_t> pcm(static_cast<std::size_t>(frames) *
-                                          kAudioChannels);
-            std::array<std::vector<std::int16_t>, 2> sourcePcm{
+                                          kAudioOutputChannels);
+            std::array<std::vector<std::int16_t>, kSeparateAudioTrackCount> sourcePcm{
                 std::vector<std::int16_t>(blockSampleCount),
                 std::vector<std::int16_t>(blockSampleCount)};
             for (std::size_t i = 0; i < blockSampleCount; ++i) {
                 for (std::size_t track = 0; track < sourceMix.size(); ++track) {
                     const float sourceSample = std::clamp(sourceMix[track][i],
-                        -32768.0f, 32767.0f);
+                        kPcmMinimum, kPcmMaximum);
                     sourcePcm[track][i] = static_cast<std::int16_t>(
                         std::lround(sourceSample));
                 }
@@ -1202,7 +1268,7 @@ void RecordingSession::Impl::Run() {
             }
             for (std::size_t i = 0; i < pcm.size(); ++i) {
                 const float limited = std::clamp(mix[i] * audioLimiterGain,
-                                                  -kLimiterCeiling, kLimiterCeiling);
+                                                  -kAudioLimiterCeiling, kAudioLimiterCeiling);
                 pcm[i] = static_cast<std::int16_t>(std::lround(limited));
             }
             if (!writePcm(pcm.data(), frames)) {
@@ -1230,43 +1296,56 @@ void RecordingSession::Impl::Run() {
             throw SessionError{L"COM/WinRT 初始化失败：" + Utf8ToWide(error.what())};
         }
 
-        HRESULT hr = ::MFStartup(MF_VERSION, MFSTARTUP_FULL);
-        if (FAILED(hr)) {
-            throw SessionError{L"Media Foundation 启动失败：" + HrTextWide(hr)};
+        HRESULT hr = S_OK;
+        if (!isGif) {
+            hr = ::MFStartup(MF_VERSION, MFSTARTUP_FULL);
+            if (FAILED(hr)) {
+                throw SessionError{L"Media Foundation 启动失败：" + HrTextWide(hr)};
+            }
+            mfStarted = true;
         }
-        mfStarted = true;
 
         if (stopRequested.load()) {
             throw Cancelled{};
         }
 
-        std::wstring hardwareError;
-        if (!OpenWriter(true, writer, outputFile, videoStream, audioStream, encoderInfo,
-                        hardwareError)) {
-            std::wstring softwareError;
-            if (!OpenWriter(false, writer, outputFile, videoStream, audioStream, encoderInfo,
-                            softwareError)) {
-                throw SessionError{
-                    L"H.264/AAC 编码初始化失败。硬件尝试：" + hardwareError +
-                    L"；软件尝试：" + softwareError};
+        if (isGif) {
+            std::wstring gifError;
+            if (!detail::CreateRecordingOutputFile(config.outputDirectory,
+                    L"Recording_" + CurrentTimestampForFileName(), finalPath, partialPath,
+                    gifOutputFile.GetAddressOf(), &gifError, RecordingFormat::Gif)) {
+                throw SessionError{gifError};
             }
-            encoderInfo += L"（硬件不可用，已回退软件）";
-        }
+            encoderInfo = L"GIF 动画（无声）";
+        } else {
+            std::wstring hardwareError;
+            if (!OpenWriter(true, writer, outputFile, videoStream, audioStream, encoderInfo,
+                            hardwareError)) {
+                std::wstring softwareError;
+                if (!OpenWriter(false, writer, outputFile, videoStream, audioStream, encoderInfo,
+                                softwareError)) {
+                    throw SessionError{
+                        L"H.264/AAC 编码初始化失败。硬件尝试：" + hardwareError +
+                        L"；软件尝试：" + softwareError};
+                }
+                encoderInfo += L"（硬件不可用，已回退软件）";
+            }
 
-        const std::filesystem::path outputPath(finalPath);
-        const std::wstring stem = outputPath.stem().wstring();
-        sourceAudioPaths[0] = (outputPath.parent_path() /
-            (stem + L"_system_partial.m4a")).wstring();
-        sourceAudioPaths[1] = (outputPath.parent_path() /
-            (stem + L"_microphone_partial.m4a")).wstring();
-        for (std::size_t i = 0; i < sourceAudioWriters.size(); ++i) {
-            std::wstring audioWriterError;
-            if (!OpenAudioOnlyWriter(sourceAudioPaths[i], sourceAudioWriters[i],
-                                     &audioWriterError)) {
-                throw SessionError{L"初始化独立音轨失败：" + audioWriterError};
+            const std::filesystem::path outputPath(finalPath);
+            const std::wstring stem = outputPath.stem().wstring();
+            sourceAudioPaths[0] = (outputPath.parent_path() /
+                (stem + L"_system_partial.m4a")).wstring();
+            sourceAudioPaths[1] = (outputPath.parent_path() /
+                (stem + L"_microphone_partial.m4a")).wstring();
+            for (std::size_t i = 0; i < sourceAudioWriters.size(); ++i) {
+                std::wstring audioWriterError;
+                if (!OpenAudioOnlyWriter(sourceAudioPaths[i], sourceAudioWriters[i],
+                                         &audioWriterError)) {
+                    throw SessionError{L"初始化独立音轨失败：" + audioWriterError};
+                }
             }
+            encoderInfo += L" + 混合/系统/麦克风三条 AAC 音轨";
         }
-        encoderInfo += L" + 混合/系统/麦克风三条 AAC 音轨";
 
         if (stopRequested.load()) {
             throw Cancelled{};
@@ -1277,7 +1356,7 @@ void RecordingSession::Impl::Run() {
         if (!capture->Start(config.monitor, config.fps, &captureError)) {
             throw SessionError{L"屏幕捕获启动失败：" + captureError};
         }
-        if (!capture->WaitForFirstFrame(3000, &captureError)) {
+        if (!capture->WaitForFirstFrame(kFirstFrameTimeoutMs, &captureError)) {
             throw SessionError{L"等待首帧失败：" + captureError};
         }
         if (stopRequested.load()) {
@@ -1308,13 +1387,22 @@ void RecordingSession::Impl::Run() {
                                         frameSize.width);
         const int cropBottom = scaleEdge(config.sourceRect.bottom, monitorHeight,
                                          frameSize.height);
-        if (!converter.Configure(frameSize.width, frameSize.height,
-                                 cropLeft, cropTop,
-                                 cropRight - cropLeft, cropBottom - cropTop,
-                                 outputInfo.content.width, outputInfo.content.height,
-                                 outputInfo.output.width, outputInfo.output.height,
-                                 &convertError)) {
-            throw SessionError{L"画面裁剪/缩放配置失败：" + convertError};
+        capturedSize = frameSize;
+        if (isGif) {
+            const RECT crop{cropLeft, cropTop, cropRight, cropBottom};
+            if (!gifWriter.Open(gifOutputFile.Get(), frameSize, crop, outputInfo, &convertError)) {
+                throw SessionError{L"GIF 初始化失败：" + convertError};
+            }
+            gifOutputFile.Reset();
+        } else {
+            if (!converter.Configure(frameSize.width, frameSize.height,
+                                     cropLeft, cropTop,
+                                     cropRight - cropLeft, cropBottom - cropTop,
+                                     outputInfo.content.width, outputInfo.content.height,
+                                     outputInfo.output.width, outputInfo.output.height,
+                                     &convertError)) {
+                throw SessionError{L"画面裁剪/缩放配置失败：" + convertError};
+            }
         }
         converterReady = true;
 
@@ -1361,25 +1449,27 @@ void RecordingSession::Impl::Run() {
         state.store(RecorderState::Recording, std::memory_order_release);
         elapsed100ns.store(0, std::memory_order_relaxed);
 
-        const std::int64_t frameDuration = kTicksPerSecond / config.fps;
+        const std::int64_t frameDuration = kHundredNanosecondsPerSecond / config.fps;
         std::int64_t frameIndex = 0;
         std::int64_t lastVideoTimestamp = -1;
         // After a stop request is observed, encode at most one final frame and
         // leave the loop. Without this guard a stop that lands between two
         // frame timestamps would `continue` forever on the same frame index.
         bool finalFrameWritten = false;
-        const std::uint64_t stopSpace = StopSpaceThresholdWithAudioTracks(
-            MbpsToBitsPerSecond(static_cast<double>(config.bitrateMbps)), 3);
-        std::int64_t nextStorageCheck = QpcNow100ns() + 2 * kTicksPerSecond;
+        const std::uint64_t stopSpace = isGif
+            ? GifStopSpace(outputInfo.output, config.fps)
+            : StopSpaceThresholdWithAudioTracks(
+                MbpsToBitsPerSecond(static_cast<double>(config.bitrateMbps)), kAudioTrackCount);
+        std::int64_t nextStorageCheck = QpcNow100ns() + kStorageCheckInterval;
 
         for (;;) {
-            processAudioRequest();
+            if (!isGif) processAudioRequest();
             microphoneLevel.store(microphoneSource.capture != nullptr
                     ? microphoneSource.capture->inputLevel() : 0.0f,
                 std::memory_order_relaxed);
             const std::int64_t now = QpcNow100ns();
             if (stopElapsed < 0 && now >= nextStorageCheck) {
-                nextStorageCheck = now + 2 * kTicksPerSecond;
+                nextStorageCheck = now + kStorageCheckInterval;
                 std::wstring storageError;
                 if (!detail::CheckRecordingStorage(config.outputDirectory, stopSpace,
                                                     &storageError)) {
@@ -1427,7 +1517,13 @@ void RecordingSession::Impl::Run() {
                 break;
             }
 
-            const std::int64_t frameTimestamp = frameIndex * kTicksPerSecond / config.fps;
+            // Encoding can miss capture slots. Skip those slots instead of
+            // submitting a burst of old frames with near-identical timestamps.
+            if (stopElapsed < 0) {
+                frameIndex = detail::AdvanceVideoFrameIndex(frameIndex, config.fps,
+                    QpcNow100ns() - zeroQpc);
+            }
+            const std::int64_t frameTimestamp = detail::VideoFrameTimestamp(frameIndex, config.fps);
             if (stopElapsed >= 0) {
                 if (frameTimestamp >= stopElapsed || finalFrameWritten) {
                     break;
@@ -1443,7 +1539,7 @@ void RecordingSession::Impl::Run() {
                     capture->HasError() || audioNeedsAttention()) {
                     break;
                 }
-                ::Sleep(2);
+                ::Sleep(kCapturePollIntervalMs);
             }
 
             const bool stopping = stopElapsed >= 0;
@@ -1461,30 +1557,34 @@ void RecordingSession::Impl::Run() {
                     setFailure(L"捕获画面尺寸无效");
                     break;
                 }
-                converter.Convert(latestBgra.data(), width * 4, nv12);
+                if (width != capturedSize.width || height != capturedSize.height) {
+                    setFailure(L"捕获画面尺寸已变化，请重新开始录制");
+                    break;
+                }
+                if (!isGif) converter.Convert(latestBgra.data(), width * 4, nv12);
                 haveFrame = true;
             }
             if (!haveFrame) {
                 if (stopping) {
                     break;
                 }
-                ::Sleep(2);
+                ::Sleep(kCapturePollIntervalMs);
                 continue;
             }
 
-            // Use the capture timestamp when the encoder is behind so the
-            // video does not pack all encoded frames into the first seconds
-            // and hold the last frame for the remainder of the recording.
-            const std::int64_t captureTimestamp =
-                frameQpc > 0 ? std::max<std::int64_t>(0, frameQpc - zeroQpc)
-                             : frameTimestamp;
-            std::int64_t sampleTimestamp = std::max(frameTimestamp, captureTimestamp);
-            sampleTimestamp = std::max(sampleTimestamp, lastVideoTimestamp + 1);
+            // MP4 uses the real-time frame grid. A captured frame's QPC can
+            // stay ahead of an overdue slot; using last+1 then collapses to
+            // duplicate timestamps in the MP4 timescale. GIF keeps wall time
+            // because palette encoding can produce irregular frame intervals.
+            std::int64_t sampleTimestamp = isGif
+                ? std::max(frameTimestamp, QpcNow100ns() - zeroQpc)
+                : frameTimestamp;
             if (stopping) {
                 sampleTimestamp = std::max(sampleTimestamp, stopElapsed);
             }
             if (!writeVideoSample(sampleTimestamp, frameDuration)) {
-                setFailure(L"写入 H.264 视频帧失败");
+                setFailure(isGif ? L"写入 GIF 画面失败：" + frameWriteError
+                                 : L"写入 H.264 视频帧失败");
                 break;
             }
             lastVideoTimestamp = sampleTimestamp;
@@ -1494,7 +1594,7 @@ void RecordingSession::Impl::Run() {
             }
 
             const bool drainOk = drainAudio(stopElapsed >= 0
-                               ? stopElapsed * kAudioRate / kTicksPerSecond
+                               ? stopElapsed * kAudioOutputRate / kHundredNanosecondsPerSecond
                                : -1);
             if (!drainOk) {
                 break;
@@ -1505,9 +1605,6 @@ void RecordingSession::Impl::Run() {
             ++frameIndex;
         }
 
-        if (!failure) {
-            cleanStop = true;
-        }
         if (stopElapsed < 0) {
             stopElapsed = std::max<std::int64_t>(0, QpcNow100ns() - zeroQpc);
         }
@@ -1536,9 +1633,29 @@ void RecordingSession::Impl::Run() {
             capture->Stop();
         }
 
-        if (writer != nullptr && videoFrames > 0) {
+        if (isGif) {
+            if (videoFrames > 0) {
+                state.store(RecorderState::Saving, std::memory_order_release);
+                std::wstring gifError;
+                const std::int64_t endTimestamp = std::max(stopElapsed,
+                    lastVideoTimestamp + 10 * kHundredNanosecondsPerMillisecond);
+                if (!gifWriter.Finish(endTimestamp, &gifError)) {
+                    setFailure(L"GIF 收尾失败：" + gifError);
+                }
+                gifWriter.Close();
+                gifOutputFile.Reset();
+                if (!failure && !detail::CommitRecordingOutputFile(partialPath, finalPath, &gifError)) {
+                    setFailure(gifError);
+                }
+            } else {
+                gifWriter.Close();
+                gifOutputFile.Reset();
+                if (!partialPath.empty()) ::DeleteFileW(partialPath.c_str());
+                if (!failure) setFailure(L"没有录制到有效画面");
+            }
+        } else if (writer != nullptr && videoFrames > 0) {
             state.store(RecorderState::Saving, std::memory_order_release);
-            if (!drainAudio(stopElapsed * kAudioRate / kTicksPerSecond)) {
+            if (!drainAudio(stopElapsed * kAudioOutputRate / kHundredNanosecondsPerSecond)) {
                 setFailure(L"无法完成音频收尾");
             }
             hr = writer->Finalize();
@@ -1616,6 +1733,8 @@ void RecordingSession::Impl::Run() {
         liveCapture.reset();
     }
     capture.reset();
+    gifWriter.Close();
+    gifOutputFile.Reset();
     if (writer != nullptr) {
         writer.Reset();
     }
@@ -1623,13 +1742,18 @@ void RecordingSession::Impl::Run() {
         outputFile->Close();
         outputFile.Reset();
     }
-    for (AudioOnlyWriter& track : sourceAudioWriters) {
+    std::vector<std::wstring> recoveryPaths;
+    for (std::size_t i = 0; i < sourceAudioWriters.size(); ++i) {
+        AudioOnlyWriter& track = sourceAudioWriters[i];
         track.writer.Reset();
         if (track.outputFile != nullptr) {
             track.outputFile->Close();
             track.outputFile.Reset();
         }
-        if (!track.path.empty()) ::DeleteFileW(track.path.c_str());
+        // A failed save must retain the independent sources alongside the
+        // partial MP4. path is assigned only after this session owns the file.
+        detail::CleanupRecordingAudioFile(track.path,
+            failure && sourceAudioSamplesWritten[i] > 0, recoveryPaths);
     }
 
     bool partialRemains = false;
@@ -1644,13 +1768,14 @@ void RecordingSession::Impl::Run() {
     finalResult.success = !failure && videoFrames > 0;
     finalResult.finalPath = finalResult.success ? finalPath : std::wstring();
     finalResult.partialPath = partialRemains ? partialPath : std::wstring();
+    finalResult.recoveryPaths = std::move(recoveryPaths);
     finalResult.error = failure ? failureMessage : std::wstring();
     finalResult.encoderInfo = encoderInfo;
     finalResult.outputSize = outputInfo.output;
     finalResult.videoFrames = videoFrames;
     finalResult.audioChunks = audioChunks;
     finalResult.durationSeconds =
-        static_cast<double>(std::max<std::int64_t>(0, stopElapsed)) / kTicksPerSecond;
+        static_cast<double>(std::max<std::int64_t>(0, stopElapsed)) / kHundredNanosecondsPerSecond;
     finalResult.partialRemains = partialRemains;
 
     {
@@ -1694,8 +1819,9 @@ bool RecordingSession::Start(const RecordingConfig& config, std::wstring* error)
     {
         std::lock_guard lock(impl_->audioControlMutex);
         impl_->liveAudio = {};
-        impl_->liveAudio.currentMask = (config.systemAudio ? 1U : 0U) |
-                                      (config.microphone ? 2U : 0U);
+        const bool hasAudio = config.format == RecordingFormat::Mp4;
+        impl_->liveAudio.currentMask = (hasAudio && config.systemAudio ? kSystemSourceBit : 0U) |
+                                      (hasAudio && config.microphone ? kMicrophoneSourceBit : 0U);
         impl_->liveAudio.requestedMask = impl_->liveAudio.currentMask;
         impl_->liveAudio.baseMask = impl_->liveAudio.currentMask;
         impl_->audioStatus = {};
@@ -1799,20 +1925,25 @@ bool RecordingSession::SetAudioEnabled(bool systemAudio, bool microphone) {
         impl_->stopRequested.load(std::memory_order_relaxed) || impl_->audioStatus.pending) {
         return false;
     }
-    const unsigned mask = (systemAudio ? 1U : 0U) | (microphone ? 2U : 0U);
+    if (impl_->config.format == RecordingFormat::Gif) {
+        impl_->audioStatus.error = L"GIF 动画不包含声音";
+        ++impl_->audioStatus.revision;
+        return false;
+    }
+    const unsigned mask = (systemAudio ? kSystemSourceBit : 0U) |
+                          (microphone ? kMicrophoneSourceBit : 0U);
     if (mask == impl_->liveAudio.currentMask) {
         return true;
     }
     const unsigned changed = mask ^ impl_->liveAudio.currentMask;
-    const std::size_t transitionsNeeded = ((changed & 1U) != 0 ? 1U : 0U) +
-                                          ((changed & 2U) != 0 ? 1U : 0U);
+    const std::size_t transitionsNeeded = ((changed & kSystemSourceBit) != 0 ? 1U : 0U) +
+                                          ((changed & kMicrophoneSourceBit) != 0 ? 1U : 0U);
     if (now <= 0 || impl_->liveAudio.zeroQpc <= 0 ||
         RelativeSample(now, impl_->liveAudio.zeroQpc) < impl_->liveAudio.mixedThroughSample ||
-        impl_->liveAudio.transitions.size() + transitionsNeeded > 64) {
+        impl_->liveAudio.transitions.size() + transitionsNeeded > kMaximumAudioTransitions) {
         return false;
     }
     impl_->liveAudio.requestedMask = mask;
-    impl_->liveAudio.requestQpc = now;
     impl_->audioStatus.pending = true;
     impl_->audioStatus.error.clear();
     ++impl_->audioStatus.revision;

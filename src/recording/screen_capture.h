@@ -18,7 +18,8 @@ struct ScreenshotFrame {
 };
 
 // Windows Graphics Capture session that keeps the most recent desktop frame in
-// CPU BGRA form. CopyLatestFrame() only returns true when a newer frame is
+// CPU SDR BGRA form. Advanced-color/HDR surfaces are captured in FP16 and
+// converted on the GPU before readback. CopyLatestFrame() only returns true when a newer frame is
 // available, so the recorder can reuse its last converted NV12 frame for a
 // static desktop.
 class ScreenCapture {

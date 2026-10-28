@@ -17,6 +17,7 @@ namespace {
 
 ULONG_PTR g_gdiplusToken = 0;
 bool g_gdiplusReady = false;
+constexpr float kMicrophoneActivityThreshold = 0.006f;
 
 struct GdiplusRuntime {
     GdiplusRuntime() {
@@ -191,7 +192,7 @@ void DrawIconButton(const DRAWITEMSTRUCT& item, ControlIcon icon, bool active,
     const bool focused = (item.itemState & ODS_FOCUS) != 0;
     const bool highContrast = HighContrast();
     const bool soundDetected = icon == ControlIcon::Microphone && active &&
-                               microphoneLevel >= 0.006f;
+                               microphoneLevel >= kMicrophoneActivityThreshold;
     ::FillRect(item.hDC, &item.rcItem, ::GetSysColorBrush(COLOR_WINDOW));
     COLORREF foreground = disabled ? ::GetSysColor(COLOR_GRAYTEXT)
         : highContrast ? ::GetSysColor(COLOR_WINDOWTEXT)
@@ -414,6 +415,27 @@ void DrawLayeredPanel(HDC dc, std::uint32_t* pixels, int width, int height,
         if(old)::SelectObject(dc,old);
     }
     MakeLayeredRoundedOpaque(pixels,width,height,clipped,radius);
+}
+
+void DrawRecordingIndicator(HDC dc, const RECT& rect, bool recording) {
+    const COLORREF color = HighContrast() ? ::GetSysColor(COLOR_WINDOWTEXT)
+        : recording ? RGB(196, 43, 28) : RGB(110, 116, 126);
+    if (g_gdiplusReady) {
+        Gdiplus::Graphics graphics(dc);
+        graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+        graphics.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
+        Gdiplus::SolidBrush brush(Gdiplus::Color(255, GetRValue(color), GetGValue(color), GetBValue(color)));
+        graphics.FillEllipse(&brush, static_cast<float>(rect.left), static_cast<float>(rect.top),
+            static_cast<float>(rect.right - rect.left), static_cast<float>(rect.bottom - rect.top));
+        return;
+    }
+    HBRUSH brush = ::CreateSolidBrush(color);
+    const HGDIOBJ oldBrush = ::SelectObject(dc, brush);
+    const HGDIOBJ oldPen = ::SelectObject(dc, ::GetStockObject(NULL_PEN));
+    ::Ellipse(dc, rect.left, rect.top, rect.right, rect.bottom);
+    ::SelectObject(dc, oldPen);
+    ::SelectObject(dc, oldBrush);
+    ::DeleteObject(brush);
 }
 
 void DrawRoundedPanel(HDC dc, const RECT& rect, COLORREF fill, COLORREF border,

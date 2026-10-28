@@ -12,10 +12,13 @@
 #include <cstring>
 #include <deque>
 #include <format>
+#include <iterator>
+#include <limits>
 #include <thread>
 
 #include "common/win32.h"
 #include "core/audio_rules.h"
+#include "core/recording_format.h"
 #include "recording/screen_capture.h"
 
 namespace srl {
@@ -23,8 +26,19 @@ namespace {
 
 using Microsoft::WRL::ComPtr;
 
-constexpr std::uint32_t kOutputRate = kAudioOutputRate;
-constexpr std::uint32_t kOutputChannels = kAudioOutputChannels;
+constexpr std::uint32_t kMinimumInputSampleRate = 8'000;
+constexpr DWORD kCaptureEventPollTimeoutMs = 100;
+constexpr REFERENCE_TIME kCaptureBufferDuration100ns =
+    200 * kHundredNanosecondsPerMillisecond;
+constexpr float kMicrophoneLevelDecayMs = 180.0f;
+constexpr long double kPcm16NormalizationScale =
+    -static_cast<long double>(std::numeric_limits<std::int16_t>::min());
+constexpr double kPcm32NormalizationScale =
+    -static_cast<double>(std::numeric_limits<std::int32_t>::min());
+constexpr float kPcm16PositivePeak =
+    static_cast<float>(std::numeric_limits<std::int16_t>::max());
+
+static_assert(kAudioOutputChannels == 2, "the channel converter outputs stereo PCM");
 
 struct FormatDescription {
     bool valid = false;
@@ -51,8 +65,9 @@ FormatDescription DescribeFormat(const WAVEFORMATEX& format) {
     }
 
     description.isFloat = isFloat;
-    description.valid = description.channels >= 1 && description.sampleRate >= 8000 &&
-                        description.blockAlign >= 2 &&
+    description.valid = description.channels >= 1 &&
+                        description.sampleRate >= kMinimumInputSampleRate &&
+                        description.blockAlign >= sizeof(std::int16_t) &&
                         ((isFloat && description.bitsPerSample == 32) ||
                          (isPcm && (description.bitsPerSample == 16 ||
                                     description.bitsPerSample == 32)));
@@ -63,11 +78,11 @@ std::uint32_t OutputFrameCount(std::uint32_t inputFrames, std::uint32_t inputRat
     if (inputFrames == 0) {
         return 0;
     }
-    if (inputRate == kOutputRate) {
+    if (inputRate == kAudioOutputRate) {
         return inputFrames;
     }
     const std::uint64_t scaled =
-        static_cast<std::uint64_t>(inputFrames) * kOutputRate + inputRate / 2;
+        static_cast<std::uint64_t>(inputFrames) * kAudioOutputRate + inputRate / 2;
     return static_cast<std::uint32_t>(scaled / inputRate);
 }
 
@@ -115,7 +130,8 @@ struct AudioCapture::Impl {
         if (source == AudioSource::Microphone) {
             long double energy = 0.0L;
             for (const std::int16_t sample : samples) {
-                const long double normalized = static_cast<long double>(sample) / 32768.0L;
+                const long double normalized =
+                    static_cast<long double>(sample) / kPcm16NormalizationScale;
                 energy += normalized * normalized;
             }
             rms = static_cast<float>(
@@ -147,7 +163,7 @@ struct AudioCapture::Impl {
                                             DWORD flags) const {
         const std::uint32_t outputFrames = OutputFrameCount(frames, format.sampleRate);
         std::vector<std::int16_t> output(
-            static_cast<std::size_t>(outputFrames) * kOutputChannels, 0);
+            static_cast<std::size_t>(outputFrames) * kAudioOutputChannels, 0);
         if (outputFrames == 0) {
             return output;
         }
@@ -167,16 +183,16 @@ struct AudioCapture::Impl {
             if (format.bitsPerSample == 16) {
                 std::int16_t value = 0;
                 std::memcpy(&value, sample, sizeof(value));
-                return static_cast<float>(value) / 32768.0f;
+                return static_cast<float>(value) / static_cast<float>(kPcm16NormalizationScale);
             }
             std::int32_t value = 0;
             std::memcpy(&value, sample, sizeof(value));
-            return static_cast<float>(static_cast<double>(value) / 2147483648.0);
+            return static_cast<float>(static_cast<double>(value) / kPcm32NormalizationScale);
         };
 
         const float ratio =
-            static_cast<float>(format.sampleRate) / static_cast<float>(kOutputRate);
-        const bool direct = format.sampleRate == kOutputRate;
+            static_cast<float>(format.sampleRate) / static_cast<float>(kAudioOutputRate);
+        const bool direct = format.sampleRate == kAudioOutputRate;
         const std::uint16_t leftChannel = 0;
         const std::uint16_t rightChannel = format.channels > 1 ? 1 : 0;
 
@@ -201,10 +217,10 @@ struct AudioCapture::Impl {
             }
             const auto toPcm = [](float value) -> std::int16_t {
                 const float clamped = std::clamp(value, -1.0f, 1.0f);
-                return static_cast<std::int16_t>(std::lround(clamped * 32767.0f));
+                return static_cast<std::int16_t>(std::lround(clamped * kPcm16PositivePeak));
             };
-            output[static_cast<std::size_t>(i) * 2] = toPcm(left);
-            output[static_cast<std::size_t>(i) * 2 + 1] = toPcm(right);
+            output[static_cast<std::size_t>(i) * kAudioOutputChannels] = toPcm(left);
+            output[static_cast<std::size_t>(i) * kAudioOutputChannels + 1] = toPcm(right);
         }
         return output;
     }
@@ -221,7 +237,8 @@ struct AudioCapture::Impl {
         while (!stopping.load(std::memory_order_relaxed)) {
             const HANDLE handles[] = {sampleEvent, stopEvent};
             const DWORD waitResult =
-                ::WaitForMultipleObjects(2, handles, FALSE, 100);
+                ::WaitForMultipleObjects(static_cast<DWORD>(std::size(handles)), handles,
+                                          FALSE, kCaptureEventPollTimeoutMs);
             if (waitResult == WAIT_OBJECT_0 + 1) {
                 break;
             }
@@ -396,7 +413,8 @@ bool AudioCapture::Start(std::wstring* error) {
     if (loopback) {
         streamFlags |= AUDCLNT_STREAMFLAGS_LOOPBACK;
     }
-    hr = impl_->client->Initialize(AUDCLNT_SHAREMODE_SHARED, streamFlags, 2'000'000, 0,
+    hr = impl_->client->Initialize(AUDCLNT_SHAREMODE_SHARED, streamFlags,
+                                   kCaptureBufferDuration100ns, 0,
                                    format, nullptr);
     if (FAILED(hr)) {
         return fail(Utf8ToWide(std::format("IAudioClient::Initialize({}) failed: {}",
@@ -488,7 +506,7 @@ float AudioCapture::inputLevel() const noexcept {
     const std::uint64_t ageMs = ::GetTickCount64() - updated;
     const float rms = impl_->microphoneRms.load(std::memory_order_relaxed);
     // Let the meter decay smoothly if an endpoint briefly stops delivering packets.
-    return rms * std::exp(-static_cast<float>(ageMs) / 180.0f);
+    return rms * std::exp(-static_cast<float>(ageMs) / kMicrophoneLevelDecayMs);
 }
 
 std::wstring AudioCapture::error() const {

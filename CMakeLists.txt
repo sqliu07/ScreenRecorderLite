@@ -13,7 +13,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # Portable build: static MSVC runtime.
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
-option(SRL_BUILD_PROBE "Build the M0 technical-feasibility probe (development tool)" ON)
+option(SRL_BUILD_PROBE "Build diagnostic tools (excluded from the portable release)" ON)
 option(SRL_BUILD_TESTS "Build unit tests" ON)
 
 add_compile_definitions(
@@ -45,11 +45,45 @@ endif()
 # ---------------------------------------------------------------------------
 add_library(srl_logic STATIC
     src/core/bgra_to_nv12.cpp
+    src/core/hdr_tone_map.cpp
     src/core/output_size.cpp
     src/core/storage.cpp
 )
 target_include_directories(srl_logic PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_compile_features(srl_logic PUBLIC cxx_std_20)
+
+# FFmpeg only remuxes already encoded H.264/AAC. Keep its LGPL DLLs replaceable.
+find_package(FFMPEG REQUIRED)
+set(SRL_MEDIA_RUNTIME_FILES)
+foreach(SRL_MEDIA_LIBRARY IN ITEMS avformat avcodec avutil)
+    file(GLOB SRL_MEDIA_DLL CONFIGURE_DEPENDS
+        "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/bin/${SRL_MEDIA_LIBRARY}*.dll")
+    list(LENGTH SRL_MEDIA_DLL SRL_MEDIA_DLL_COUNT)
+    if(NOT SRL_MEDIA_DLL_COUNT EQUAL 1)
+        message(FATAL_ERROR "Expected one ${SRL_MEDIA_LIBRARY} runtime DLL in the selected SDK")
+    endif()
+    add_library(srl_${SRL_MEDIA_LIBRARY} SHARED IMPORTED GLOBAL)
+    set_target_properties(srl_${SRL_MEDIA_LIBRARY} PROPERTIES
+        IMPORTED_IMPLIB "${FFMPEG_lib${SRL_MEDIA_LIBRARY}_LIBRARY_RELEASE}"
+        IMPORTED_LOCATION "${SRL_MEDIA_DLL}"
+        INTERFACE_INCLUDE_DIRECTORIES "${FFMPEG_INCLUDE_DIRS}")
+    list(APPEND SRL_MEDIA_RUNTIME_FILES "${SRL_MEDIA_DLL}")
+endforeach()
+add_library(srl_ffmpeg INTERFACE)
+target_link_libraries(srl_ffmpeg INTERFACE srl_avformat srl_avcodec srl_avutil)
+
+# Packaging reads the actual configured SDK rather than guessing versions/paths.
+file(TO_CMAKE_PATH "$ENV{VCPKG_ROOT}" SRL_DEPENDENCY_VCPKG_ROOT)
+file(TO_CMAKE_PATH "${VCPKG_INSTALLED_DIR}" SRL_DEPENDENCY_INSTALLED_ROOT)
+list(JOIN SRL_MEDIA_RUNTIME_FILES "\",\n    \"" SRL_DEPENDENCY_RUNTIME_JSON)
+configure_file(cmake/srl-dependency.json.in srl-dependency.json @ONLY)
+
+function(srl_deploy_media target)
+    add_custom_command(TARGET ${target} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${SRL_MEDIA_RUNTIME_FILES}
+                "$<TARGET_FILE_DIR:${target}>"
+        COMMAND_EXPAND_LISTS VERBATIM)
+endfunction()
 
 # ---------------------------------------------------------------------------
 # srl_core: Win32 / COM / Media Foundation diagnostic building blocks.
@@ -65,17 +99,21 @@ add_library(srl_core STATIC
     src/media/mp4_muxer.cpp
     src/image/png_probe.cpp
     src/image/png_writer.cpp
+    src/image/gif_writer.cpp
     src/capture/wgc_probe.cpp
     src/capture/exclusion_probe.cpp
     src/recording/audio_capture.cpp
     src/recording/screen_capture.cpp
+    src/recording/hdr_tone_mapper.cpp
     src/recording/recorder.cpp
 )
 target_link_libraries(srl_core
     PUBLIC
         srl_logic
+        srl_ffmpeg
         windowsapp
         d3d11
+        d3dcompiler
         dxgi
         mfplat
         mfreadwrite
@@ -148,48 +186,24 @@ target_link_libraries(ScreenRecorderLite PRIVATE srl_core comctl32 gdiplus uxthe
 target_compile_definitions(ScreenRecorderLite PRIVATE SRL_VERSION="${PROJECT_VERSION}")
 srl_attach_manifest(ScreenRecorderLite)
 
-set(SRL_FFMPEG_ROOT "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}")
-set(SRL_FFMPEG_EXE "" CACHE FILEPATH "FFmpeg executable to bundle (defaults to vcpkg)")
-if(NOT SRL_FFMPEG_EXE)
-    set(SRL_FFMPEG_EXE "${SRL_FFMPEG_ROOT}/tools/ffmpeg/ffmpeg.exe")
-endif()
-if(NOT EXISTS "${SRL_FFMPEG_EXE}")
-    message(FATAL_ERROR "vcpkg FFmpeg executable is missing: ${SRL_FFMPEG_EXE}")
-endif()
-file(GLOB SRL_FFMPEG_DLLS CONFIGURE_DEPENDS "${SRL_FFMPEG_ROOT}/bin/*.dll")
-add_custom_command(TARGET ScreenRecorderLite POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different "${SRL_FFMPEG_EXE}"
-            "$<TARGET_FILE_DIR:ScreenRecorderLite>/ffmpeg.exe"
-    COMMAND_EXPAND_LISTS
-    VERBATIM
-)
-foreach(SRL_FFMPEG_DLL IN LISTS SRL_FFMPEG_DLLS)
-    add_custom_command(TARGET ScreenRecorderLite POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${SRL_FFMPEG_DLL}"
-                "$<TARGET_FILE_DIR:ScreenRecorderLite>"
-        VERBATIM
-    )
-endforeach()
-if(TARGET srl_probe)
-    add_custom_command(TARGET srl_probe POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${SRL_FFMPEG_EXE}"
-                "$<TARGET_FILE_DIR:srl_probe>/ffmpeg.exe"
-        VERBATIM
-    )
-    foreach(SRL_FFMPEG_DLL IN LISTS SRL_FFMPEG_DLLS)
-        add_custom_command(TARGET srl_probe POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different "${SRL_FFMPEG_DLL}"
-                    "$<TARGET_FILE_DIR:srl_probe>"
-            VERBATIM
-        )
-    endforeach()
-endif()
-
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
 if(SRL_BUILD_TESTS)
     enable_testing()
+    add_executable(srl_mp4_muxer_tests tests/mp4_muxer_tests.cpp)
+    target_link_libraries(srl_mp4_muxer_tests PRIVATE srl_core)
+    target_compile_definitions(srl_mp4_muxer_tests PRIVATE
+        SRL_MUX_FIXTURE_DIR=L"${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/media")
+    add_test(NAME mp4_muxer_regression COMMAND srl_mp4_muxer_tests)
+
+    add_executable(srl_gif_writer_tests tests/gif_writer_tests.cpp)
+    target_link_libraries(srl_gif_writer_tests PRIVATE srl_core)
+    add_test(NAME animated_gif COMMAND srl_gif_writer_tests)
+
+    add_executable(srl_hdr_tests tests/hdr_tests.cpp)
+    target_link_libraries(srl_hdr_tests PRIVATE srl_core)
+    add_test(NAME hdr_capture_conversion COMMAND srl_hdr_tests)
     add_executable(srl_core_tests tests/core_tests.cpp)
     target_link_libraries(srl_core_tests PRIVATE srl_logic)
     add_test(NAME core_rules COMMAND srl_core_tests)
@@ -214,4 +228,19 @@ if(SRL_BUILD_TESTS)
         tests/screenshot_worker_tests.cpp src/app/screenshot.cpp)
     target_link_libraries(srl_screenshot_worker_tests PRIVATE srl_core)
     add_test(NAME screenshot_worker COMMAND srl_screenshot_worker_tests)
+
+    add_executable(srl_ui_text_tests tests/ui_text_tests.cpp src/app/ui_text.cpp)
+    target_include_directories(srl_ui_text_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    target_link_libraries(srl_ui_text_tests PRIVATE srl_logic)
+    add_test(NAME ui_localization COMMAND srl_ui_text_tests)
 endif()
+
+# Build individual development/test targets with their own runtime dependencies.
+foreach(SRL_EXECUTABLE IN ITEMS ScreenRecorderLite srl_probe srl_mp4_muxer_tests
+        srl_gif_writer_tests srl_hdr_tests
+        srl_image_tests srl_recorder_storage_tests srl_live_recording_tests
+        srl_screenshot_worker_tests)
+    if(TARGET ${SRL_EXECUTABLE})
+        srl_deploy_media(${SRL_EXECUTABLE})
+    endif()
+endforeach()

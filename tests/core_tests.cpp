@@ -22,15 +22,6 @@ void Check(bool condition, std::string_view what) {
     }
 }
 
-void CheckSize(const srl::Size& actual, int width, int height, std::string_view what) {
-    ++g_checks;
-    if (actual.width != width || actual.height != height) {
-        ++g_failures;
-        std::printf("FAIL: %.*s (expected %dx%d, got %dx%d)\n", static_cast<int>(what.size()),
-                    what.data(), width, height, actual.width, actual.height);
-    }
-}
-
 void CheckRule(const srl::OutputSizeRequest& request, const srl::Size& content,
                const srl::Size& output, int padRight, int padBottom, bool scaledDown,
                std::string_view what) {
@@ -262,20 +253,25 @@ void TestStorage() {
     Check(srl::MbpsToBitsPerSecond(0.0) == 0, "zero Mbps");
     Check(srl::MbpsToBitsPerSecond(-1.0) == 0, "negative Mbps clamped to zero");
 
-    Check(srl::EstimateBytesPerSecond(8'000'000, true) == 1'016'000,
-          "8 Mbps + 128 kbps estimate");
-    Check(srl::EstimateBytesPerSecond(8'000'000, false) == 1'000'000,
-          "video-only estimate");
-    Check(srl::EstimateBytes(8'000'000, true, 60) == 60'960'000, "60 s estimate");
-
-    Check(srl::StartSpaceRequirement(8'000'000, true) == 512 * srl::kMiB,
-          "start threshold floor");
-    Check(srl::StopSpaceThreshold(8'000'000, true) == 128 * srl::kMiB,
-          "stop threshold floor");
-    Check(srl::StartSpaceRequirement(50'000'000, true) == 512 * srl::kMiB,
-          "50 Mbps still uses the 512 MiB floor");
-    Check(srl::StopSpaceThreshold(50'000'000, true) == 128 * srl::kMiB,
-          "50 Mbps still uses the 128 MiB floor");
+    Check(srl::EstimateBytesWithAudioTracks(8'000'000, 3, 60) == 62'880'000,
+          "recording estimate includes three independent 128 kbps AAC tracks");
+    Check(srl::EstimateBytesWithAudioTracks(8'000'000, 0, 60) == 60'000'000,
+          "zero audio tracks contributes only the video payload");
+    Check(srl::EstimateBytesWithAudioTracks(8'000'000, 1, 60) == 60'960'000,
+          "one audio track contributes 128 kbps");
+    Check(srl::EstimateBytesWithAudioTracks(8'000'000, 3, 0) == 0,
+          "zero duration contributes no recording bytes");
+    Check(srl::EstimateBytesWithAudioTracks(1, 3, 1) == 48'001,
+          "video bits round up independently of exact AAC byte rates");
+    Check(srl::StartSpaceRequirementWithAudioTracks(8'000'000, 3) == 512 * srl::kMiB,
+          "three audio tracks preserve the minimum start-space floor");
+    Check(srl::StopSpaceThresholdWithAudioTracks(8'000'000, 3) == 128 * srl::kMiB,
+          "three audio tracks preserve the minimum stop-space floor");
+    Check(srl::StartSpaceRequirementWithAudioTracks(100'000'000, 3) ==
+              752'880'000 + 128 * srl::kMiB,
+          "start-space estimate adds the safety margin above its floor");
+    Check(srl::StopSpaceThresholdWithAudioTracks(1'000'000'000, 3) == 1'250'480'000,
+          "stop-space threshold uses the ten-second estimate above its floor");
 }
 
 }  // namespace

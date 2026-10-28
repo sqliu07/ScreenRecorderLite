@@ -7,8 +7,10 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <vector>
 
 #include "core/output_size.h"
+#include "core/output_format.h"
 #include "recording/screen_capture.h"
 
 namespace srl {
@@ -30,7 +32,8 @@ struct RecordingConfig {
     RECT sourceRect{};  // monitor-local physical pixels
     ResolutionLimit limit = ResolutionLimit::P1080;
     Size customBound{};
-    int fps = 30;
+    RecordingFormat format = RecordingFormat::Mp4;
+    int fps = kDefaultMp4FrameRate;
     int bitrateMbps = 8;
     bool systemAudio = true;
     bool microphone = false;
@@ -43,6 +46,7 @@ struct RecorderResult {
     bool success = false;
     std::wstring finalPath;
     std::wstring partialPath;
+    std::vector<std::wstring> recoveryPaths;  // Preserved source audio after a failed save.
     std::wstring error;
     std::wstring encoderInfo;
     Size outputSize{};

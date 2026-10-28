@@ -3,11 +3,14 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "core/recording_format.h"
+
 namespace srl {
 
-inline constexpr std::uint32_t kAudioOutputRate = 48'000;
-inline constexpr std::uint32_t kAudioOutputChannels = 2;
-inline constexpr std::uint32_t kAudioMaxQueuedFrames = kAudioOutputRate / 2;
+inline constexpr std::uint32_t kAudioQueueDurationMs = 500;
+inline constexpr std::uint32_t kAudioMaximumFutureSkewMs = 100;
+inline constexpr std::uint32_t kAudioMaxQueuedFrames =
+    kAudioOutputRate * kAudioQueueDurationMs / 1'000;
 
 // The buffer contains PCM16 elements, so the channel count alone determines
 // the frame count. sizeof(int16_t) is relevant only when measuring bytes.
@@ -34,8 +37,10 @@ inline constexpr std::uint32_t kAudioMaxQueuedFrames = kAudioOutputRate / 2;
         (previousQpc > 0 && qpc <= previousQpc)) {
         return false;
     }
-    constexpr std::int64_t kMaximumAge = 5'000'000;       // 500 ms queue budget
-    constexpr std::int64_t kMaximumFutureSkew = 1'000'000;  // 100 ms
+    constexpr std::int64_t kMaximumAge =
+        kAudioQueueDurationMs * kHundredNanosecondsPerMillisecond;
+    constexpr std::int64_t kMaximumFutureSkew =
+        kAudioMaximumFutureSkewMs * kHundredNanosecondsPerMillisecond;
     return qpc <= now ? now - qpc <= kMaximumAge
                       : qpc - now <= kMaximumFutureSkew;
 }

@@ -5,6 +5,7 @@
 #include <string>
 
 #include "core/output_size.h"
+#include "core/output_format.h"
 
 namespace srl {
 
@@ -13,9 +14,13 @@ struct AppSettings {
     std::wstring monitorDeviceName;
     bool hasRegion = false;
     RECT region{};
+    RecordingFormat format = RecordingFormat::Mp4;
     ResolutionLimit limit = ResolutionLimit::P1080;
     Size customBound{1920, 1080};
     int fps = 30;
+    ResolutionLimit gifLimit = ResolutionLimit::P720;
+    Size gifCustomBound{1280, 720};
+    int gifFps = kDefaultGifFrameRate;
     int bitrateMbps = 8;
     bool systemAudio = true;
     bool microphone = false;

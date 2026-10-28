@@ -11,7 +11,8 @@ std::optional<Size> CustomBound(const Size& custom, std::wstring* error) {
     if (custom.width < kMinOutputDimension || custom.width > kMaxOutputDimension ||
         custom.height < kMinOutputDimension || custom.height > kMaxOutputDimension) {
         if (error != nullptr) {
-            *error = L"custom bound must be within 64..4096 on each axis";
+            *error = std::format(L"custom bound must be within {}..{} on each axis",
+                                 kMinOutputDimension, kMaxOutputDimension);
         }
         return std::nullopt;
     }
@@ -75,7 +76,8 @@ std::optional<OutputSize> ComputeOutputSize(const OutputSizeRequest& request,
     }
     if (request.sourceWidth < kMinOutputDimension ||
         request.sourceHeight < kMinOutputDimension) {
-        return fail(L"source region must be at least 64x64");
+        return fail(std::format(L"source region must be at least {}x{}",
+                                kMinOutputDimension, kMinOutputDimension));
     }
 
     Size bound;
@@ -105,12 +107,14 @@ std::optional<OutputSize> ComputeOutputSize(const OutputSizeRequest& request,
     if (request.limit == ResolutionLimit::Original) {
         if (request.sourceWidth > kMaxOutputDimension ||
             request.sourceHeight > kMaxOutputDimension) {
-            return fail(L"original size exceeds the 4096-pixel axis limit; choose a smaller cap");
+            return fail(std::format(L"original size exceeds the {}-pixel axis limit; choose a smaller cap",
+                                    kMaxOutputDimension));
         }
         const std::uint64_t sourcePixels = static_cast<std::uint64_t>(request.sourceWidth) *
                                            static_cast<std::uint64_t>(request.sourceHeight);
         if (sourcePixels > kMaxOutputPixels) {
-            return fail(L"original size exceeds 8,294,400 pixels; choose a smaller cap");
+            return fail(std::format(L"original size exceeds {} pixels; choose a smaller cap",
+                                    kMaxOutputPixels));
         }
     }
 
@@ -132,7 +136,8 @@ std::optional<OutputSize> ComputeOutputSize(const OutputSizeRequest& request,
     contentHeight = std::clamp(contentHeight, 1, kMaxOutputDimension);
 
     if (contentWidth < kMinOutputDimension || contentHeight < kMinOutputDimension) {
-        return fail(L"output is smaller than 64x64; choose a larger cap");
+        return fail(std::format(L"output is smaller than {}x{}; choose a larger cap",
+                                kMinOutputDimension, kMinOutputDimension));
     }
 
     const int padRight = contentWidth % 2;
@@ -141,15 +146,16 @@ std::optional<OutputSize> ComputeOutputSize(const OutputSizeRequest& request,
     const int outputHeight = contentHeight + padBottom;
 
     if (outputWidth < kMinOutputDimension || outputHeight < kMinOutputDimension) {
-        return fail(L"output is smaller than 64x64; choose a larger cap");
+        return fail(std::format(L"output is smaller than {}x{}; choose a larger cap",
+                                kMinOutputDimension, kMinOutputDimension));
     }
     if (outputWidth > kMaxOutputDimension || outputHeight > kMaxOutputDimension) {
-        return fail(L"output exceeds the 4096-pixel axis limit");
+        return fail(std::format(L"output exceeds the {}-pixel axis limit", kMaxOutputDimension));
     }
     const std::uint64_t outputPixels = static_cast<std::uint64_t>(outputWidth) *
                                        static_cast<std::uint64_t>(outputHeight);
     if (outputPixels > kMaxOutputPixels) {
-        return fail(L"output exceeds 8,294,400 pixels");
+        return fail(std::format(L"output exceeds {} pixels", kMaxOutputPixels));
     }
 
     return OutputSize{

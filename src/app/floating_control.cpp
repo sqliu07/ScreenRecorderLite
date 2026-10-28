@@ -21,6 +21,10 @@ constexpr int kScreenshotButtonId = 1002;
 constexpr int kAudioButtonId = 1003;
 constexpr int kMicrophoneButtonId = 1004;
 constexpr UINT_PTR kMicrophoneMeterTimerId = 2;
+constexpr UINT kMicrophoneMeterIntervalMs = 50;
+constexpr float kMicrophoneMeterFalloff = 0.82f;
+constexpr float kMicrophoneAnimationStep = 0.42f;
+constexpr float kFullTurnRadians = 6.2831853f;
 constexpr int kBaseWidth = 344;
 constexpr int kBaseHeight = 64;
 
@@ -86,40 +90,40 @@ bool FloatingControl::Create(HINSTANCE instance, Action action, Action closeActi
     if (::RegisterClassExW(&windowClass) == 0 &&
         ::GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
         if (error != nullptr) {
-            *error = L"无法注册悬浮窗类";
+            *error = ui::Text(ui::TextId::FloatingClassFailed);
         }
         return false;
     }
 
     window_ = ::CreateWindowExW(
-        WS_EX_TOPMOST, kFloatingClass, ui::Text(L"轻录 - 录制控制").c_str(),
+        WS_EX_TOPMOST, kFloatingClass, ui::Text(ui::TextId::RecordingControlsTitle).c_str(),
         WS_POPUP, 0, 0, Scale(96, kBaseWidth), Scale(96, kBaseHeight), nullptr, nullptr,
         instance, this);
     if (window_ == nullptr) {
         if (error != nullptr) {
-            *error = L"无法创建悬浮控制窗";
+            *error = ui::Text(ui::TextId::FloatingWindowFailed);
         }
         return false;
     }
     ::SetWindowLongPtrW(window_, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(this));
 
     dpi_ = ::GetDpiForWindow(window_);
-    statusLabel_ = ::CreateWindowExW(0, L"STATIC", L"3", WS_CHILD | WS_VISIBLE | SS_LEFT | SS_ENDELLIPSIS |
+    statusLabel_ = ::CreateWindowExW(0, L"STATIC", ui::Text(ui::TextId::Starting).c_str(), WS_CHILD | WS_VISIBLE | SS_LEFT | SS_ENDELLIPSIS |
                                          SS_CENTERIMAGE, 0, 0, 0, 0, window_, nullptr,
                                      instance, nullptr);
-    actionButton_ = ::CreateWindowExW(0, L"BUTTON", ui::Text(L"取消").c_str(),
+    actionButton_ = ::CreateWindowExW(0, L"BUTTON", ui::Text(ui::TextId::Cancel).c_str(),
                                       WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
                                       0, 0, 0, 0, window_,
                                       reinterpret_cast<HMENU>(static_cast<INT_PTR>(
                                           kActionButtonId)),
                                       instance, nullptr);
-    screenshotButton_ = ::CreateWindowExW(0, L"BUTTON", ui::Text(L"截图").c_str(),
+    screenshotButton_ = ::CreateWindowExW(0, L"BUTTON", ui::Text(ui::TextId::Screenshot).c_str(),
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW, 0, 0, 0, 0, window_,
         reinterpret_cast<HMENU>(static_cast<INT_PTR>(kScreenshotButtonId)), instance, nullptr);
-    audioButton_ = ::CreateWindowExW(0, L"BUTTON", ui::Text(L"系统声音").c_str(),
+    audioButton_ = ::CreateWindowExW(0, L"BUTTON", ui::Text(ui::TextId::SystemAudio).c_str(),
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW, 0, 0, 0, 0, window_,
         reinterpret_cast<HMENU>(static_cast<INT_PTR>(kAudioButtonId)), instance, nullptr);
-    microphoneButton_ = ::CreateWindowExW(0, L"BUTTON", ui::Text(L"麦克风").c_str(),
+    microphoneButton_ = ::CreateWindowExW(0, L"BUTTON", ui::Text(ui::TextId::Microphone).c_str(),
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW, 0, 0, 0, 0, window_,
         reinterpret_cast<HMENU>(static_cast<INT_PTR>(kMicrophoneButtonId)), instance, nullptr);
     RecreateFonts();
@@ -144,8 +148,8 @@ bool FloatingControl::Create(HINSTANCE instance, Action action, Action closeActi
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
         previous = button;
     }
-    SetToolTip(screenshotButton_, ui::Text(L"截图当前画面").c_str());
-    SetToolTip(actionButton_, ui::Text(L"取消录制").c_str());
+    SetToolTip(screenshotButton_, ui::TextId::CaptureCurrentFrame);
+    SetToolTip(actionButton_, ui::TextId::CancelRecording);
     SetRecordingControls(false, false, false, false);
     const DWM_WINDOW_CORNER_PREFERENCE corners = DWMWCP_ROUND;
     ::DwmSetWindowAttribute(window_, DWMWA_WINDOW_CORNER_PREFERENCE, &corners, sizeof(corners));
@@ -196,13 +200,14 @@ void FloatingControl::UpdateFonts() {
     }
 }
 
-void FloatingControl::SetToolTip(HWND control, const wchar_t* text) {
+void FloatingControl::SetToolTip(HWND control, ui::TextId text) {
     if (tooltips_ == nullptr) return;
     TOOLINFOW info{};
     info.cbSize = sizeof(info);
     info.hwnd = window_;
     info.uId = reinterpret_cast<UINT_PTR>(control);
-    info.lpszText = const_cast<wchar_t*>(text);
+    // Resource text has process lifetime; tooltip controls may retain this pointer.
+    info.lpszText = const_cast<wchar_t*>(ui::View(text).data());
     ::SendMessageW(tooltips_, TTM_UPDATETIPTEXTW, 0, reinterpret_cast<LPARAM>(&info));
 }
 
@@ -225,55 +230,67 @@ void FloatingControl::Layout() {
     }
 }
 
+void FloatingControl::SetContent(ui::TextId status, bool showAction, ui::TextId action) {
+    SetContent(ui::Text(status), showAction, action);
+}
+
 void FloatingControl::SetContent(std::wstring_view status, bool showAction,
-                                 std::wstring_view actionText) {
+                                 ui::TextId action) {
     if (window_ == nullptr) return;
-    const std::wstring localizedStatus = ui::Text(status);
+    const std::wstring localizedStatus = ui::LocalizeMessage(status);
     if (statusText_ != localizedStatus) {
         statusText_ = localizedStatus;
         ::SetWindowTextW(statusLabel_, statusText_.c_str());
     }
-    const std::wstring newAction = ui::Text(showAction ? actionText : L"保存中");
-    if (showAction != actionVisible_ || newAction != actionText_) {
+    const ui::TextId effectiveAction = showAction ? action : ui::TextId::SavingAction;
+    const std::wstring newAction = ui::Text(effectiveAction);
+    if (showAction != actionVisible_ || newAction != actionText_ || effectiveAction != actionId_) {
         actionVisible_ = showAction;
         actionText_ = newAction;
+        actionId_ = effectiveAction;
         ::SetWindowTextW(actionButton_, actionText_.c_str());
         ::EnableWindow(actionButton_, showAction ? TRUE : FALSE);
-        SetToolTip(actionButton_, ui::Text(showAction && actionText == L"停止"
-            ? L"停止并保存" : showAction ? L"取消录制" : L"正在保存").c_str());
+        SetToolTip(actionButton_, showAction && action == ui::TextId::Stop
+            ? ui::TextId::StopAndSave : showAction ? ui::TextId::CancelRecording : ui::TextId::Saving);
         ::InvalidateRect(actionButton_, nullptr, TRUE);
     }
-    if (!showAction || actionText != L"停止") {
-        SetRecordingControls(false, audioPending_, systemEnabled_, micEnabled_);
+    if (!showAction || action != ui::TextId::Stop) {
+        SetRecordingControls(false, audioPending_, systemEnabled_, micEnabled_, audioSupported_);
     }
 }
 
 void FloatingControl::SetRecordingControls(bool recording, bool audioPending,
-                                           bool systemEnabled, bool micEnabled) {
+                                           bool systemEnabled, bool micEnabled,
+                                           bool audioSupported) {
+    systemEnabled = audioSupported && systemEnabled;
+    micEnabled = audioSupported && micEnabled;
     SetRegionOutlineVisible(recording);
     const bool changed = recording_ != recording || audioPending_ != audioPending ||
-        systemEnabled_ != systemEnabled || micEnabled_ != micEnabled;
+        systemEnabled_ != systemEnabled || micEnabled_ != micEnabled || audioSupported_ != audioSupported;
     recording_ = recording;
     audioPending_ = audioPending;
+    audioSupported_ = audioSupported;
     systemEnabled_ = systemEnabled;
     micEnabled_ = micEnabled;
     if (window_ == nullptr) return;
     if (changed) {
-        ::SetWindowTextW(audioButton_, ui::Text(systemEnabled ? L"关闭系统声音" : L"开启系统声音").c_str());
-        ::SetWindowTextW(microphoneButton_, ui::Text(micEnabled ? L"关闭麦克风" : L"开启麦克风").c_str());
-        SetToolTip(audioButton_, ui::Text(audioPending ? L"正在切换声音…"
-            : systemEnabled ? L"关闭系统声音" : L"开启系统声音").c_str());
-        SetToolTip(microphoneButton_, ui::Text(audioPending ? L"正在切换声音…"
-            : micEnabled ? L"关闭麦克风" : L"开启麦克风").c_str());
+        ::SetWindowTextW(audioButton_, ui::Text(!audioSupported ? ui::TextId::GifSilent : systemEnabled
+            ? ui::TextId::MuteSystemAudio : ui::TextId::EnableSystemAudio).c_str());
+        ::SetWindowTextW(microphoneButton_, ui::Text(!audioSupported ? ui::TextId::GifSilent : micEnabled
+            ? ui::TextId::MuteMicrophone : ui::TextId::EnableMicrophone).c_str());
+        SetToolTip(audioButton_, !audioSupported ? ui::TextId::GifSilent : audioPending ? ui::TextId::ChangingAudio
+            : systemEnabled ? ui::TextId::MuteSystemAudio : ui::TextId::EnableSystemAudio);
+        SetToolTip(microphoneButton_, !audioSupported ? ui::TextId::GifSilent : audioPending ? ui::TextId::ChangingAudio
+            : micEnabled ? ui::TextId::MuteMicrophone : ui::TextId::EnableMicrophone);
         ::InvalidateRect(audioButton_, nullptr, TRUE);
         ::InvalidateRect(microphoneButton_, nullptr, TRUE);
     }
-    ::EnableWindow(audioButton_, recording && !audioPending ? TRUE : FALSE);
-    ::EnableWindow(microphoneButton_, recording && !audioPending ? TRUE : FALSE);
+    ::EnableWindow(audioButton_, recording && audioSupported && !audioPending ? TRUE : FALSE);
+    ::EnableWindow(microphoneButton_, recording && audioSupported && !audioPending ? TRUE : FALSE);
     ::EnableWindow(screenshotButton_, recording ? TRUE : FALSE);
-    const bool animateMicrophone = recording && !audioPending && micEnabled;
+    const bool animateMicrophone = recording && audioSupported && !audioPending && micEnabled;
     if (animateMicrophone && !meterTimerRunning_) {
-        ::SetTimer(window_, kMicrophoneMeterTimerId, 50, nullptr);
+        ::SetTimer(window_, kMicrophoneMeterTimerId, kMicrophoneMeterIntervalMs, nullptr);
         meterTimerRunning_ = true;
     } else if (!animateMicrophone && meterTimerRunning_) {
         ::KillTimer(window_, kMicrophoneMeterTimerId);
@@ -287,7 +304,7 @@ void FloatingControl::SetRecordingControls(bool recording, bool audioPending,
 void FloatingControl::SetMicrophoneLevel(float level) {
     if (!meterTimerRunning_ || window_ == nullptr) return;
     const float value = std::clamp(level, 0.0f, 1.0f);
-    microphoneLevel_ = value >= microphoneLevel_ ? value : microphoneLevel_ * 0.82f;
+    microphoneLevel_ = value >= microphoneLevel_ ? value : microphoneLevel_ * kMicrophoneMeterFalloff;
 }
 
 void FloatingControl::SetPosition(const MonitorInfo& monitor, const RECT* avoidScreenRect) {
@@ -410,13 +427,8 @@ void FloatingControl::OnPaint() {
     ::FillRect(dc, &client, ::GetSysColorBrush(COLOR_WINDOW));
     ui::DrawRoundedPanel(dc, client, ::GetSysColor(COLOR_WINDOW),
         ::GetSysColor(COLOR_3DSHADOW), Scale(dpi_, 12));
-    HBRUSH dot = ::CreateSolidBrush(recording_ ? RGB(196, 43, 28) : RGB(110, 116, 126));
-    HGDIOBJ oldBrush = ::SelectObject(dc, dot);
-    HGDIOBJ oldPen = ::SelectObject(dc, ::GetStockObject(NULL_PEN));
-    ::Ellipse(dc, Scale(dpi_, 12), Scale(dpi_, 28), Scale(dpi_, 20), Scale(dpi_, 36));
-    ::SelectObject(dc, oldPen);
-    ::SelectObject(dc, oldBrush);
-    ::DeleteObject(dot);
+    const RECT indicator{Scale(dpi_, 12), Scale(dpi_, 28), Scale(dpi_, 20), Scale(dpi_, 36)};
+    ui::DrawRecordingIndicator(dc, indicator, recording_);
     ::EndPaint(window_, &paint);
 }
 
@@ -453,10 +465,10 @@ LRESULT CALLBACK FloatingControl::WindowProc(HWND window, UINT message, WPARAM w
                         if (self->recording_ && self->screenshotAction_) self->screenshotAction_();
                         break;
                     case kAudioButtonId:
-                        if (self->recording_ && !self->audioPending_ && self->audioAction_) self->audioAction_(true);
+                        if (self->recording_ && self->audioSupported_ && !self->audioPending_ && self->audioAction_) self->audioAction_(true);
                         break;
                     case kMicrophoneButtonId:
-                        if (self->recording_ && !self->audioPending_ && self->audioAction_) self->audioAction_(false);
+                        if (self->recording_ && self->audioSupported_ && !self->audioPending_ && self->audioAction_) self->audioAction_(false);
                         break;
                 }
             }
@@ -481,7 +493,7 @@ LRESULT CALLBACK FloatingControl::WindowProc(HWND window, UINT message, WPARAM w
                 const ui::ControlIcon icon = item->CtlID == kAudioButtonId ? ui::ControlIcon::SystemAudio
                     : item->CtlID == kMicrophoneButtonId ? ui::ControlIcon::Microphone
                     : item->CtlID == kScreenshotButtonId ? ui::ControlIcon::Screenshot
-                    : self->actionText_ == ui::Text(L"取消")
+                    : self->actionId_ == ui::TextId::Cancel
                         ? ui::ControlIcon::Cancel : ui::ControlIcon::Stop;
                 const bool active = item->CtlID == kAudioButtonId ? self->systemEnabled_
                     : item->CtlID == kMicrophoneButtonId ? self->micEnabled_ : true;
@@ -510,9 +522,9 @@ LRESULT CALLBACK FloatingControl::WindowProc(HWND window, UINT message, WPARAM w
                 if (self->microphoneLevelProvider_ != nullptr) {
                     self->SetMicrophoneLevel(self->microphoneLevelProvider_());
                 }
-                self->microphoneAnimationPhase_ += 0.42f;
-                if (self->microphoneAnimationPhase_ >= 6.2831853f)
-                    self->microphoneAnimationPhase_ -= 6.2831853f;
+                self->microphoneAnimationPhase_ += kMicrophoneAnimationStep;
+                if (self->microphoneAnimationPhase_ >= kFullTurnRadians)
+                    self->microphoneAnimationPhase_ -= kFullTurnRadians;
                 ::InvalidateRect(self->microphoneButton_, nullptr, FALSE);
                 return 0;
             }

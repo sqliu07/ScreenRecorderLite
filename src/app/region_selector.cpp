@@ -4,21 +4,19 @@
 
 #include <algorithm>
 #include <cstdint>
-#include <format>
 #include <memory>
 #include <string>
 #include <vector>
 
-#include "common/win32.h"
 #include "app/ui_draw.h"
 #include "app/ui_text.h"
+#include "core/output_size.h"
 
 namespace srl {
 namespace {
 
 constexpr wchar_t kOverlayClass[] = L"ScreenRecorderLite.RegionOverlay";
 constexpr UINT kSelectionCompleteMessage = WM_APP + 1;
-constexpr int kMinimumSize = 64;
 
 struct Overlay;
 
@@ -75,8 +73,6 @@ void DrawLabel(Overlay& overlay, int centerX, int topY, std::wstring_view text,
     if (overlay.bits == nullptr || overlay.memoryDc == nullptr || text.empty()) {
         return;
     }
-    const std::wstring localized = ui::Text(text);
-    text = localized;
     HDC dc = overlay.memoryDc;
     const HGDIOBJ oldFont = ::SelectObject(dc, overlay.font);
     SIZE textSize{};
@@ -100,8 +96,6 @@ void DrawButton(Overlay& overlay, RECT local, std::wstring_view text,
     if (overlay.bits == nullptr || overlay.memoryDc == nullptr || text.empty()) {
         return;
     }
-    const std::wstring localized = ui::Text(text);
-    text = localized;
     ui::DrawLayeredButton(overlay.memoryDc, static_cast<std::uint32_t*>(overlay.bits),
         overlay.width, overlay.height, local, text, overlay.font,
         style, overlay.monitor.dpiX, disabled);
@@ -162,12 +156,16 @@ void RenderOverlay(Overlay& overlay, SelectionState& state) {
     }
 
     const int dpi = static_cast<int>(overlay.monitor.dpiX);
-    const wchar_t* instructionSource = !state.hasSelection
-        ? L"拖动选择区域 · Enter 确认 · Esc 取消"
-        : state.dragging
-            ? (state.valid ? L"拖动以调整区域" : L"继续拖动，选区至少 64×64")
-            : state.valid ? L"按 Enter 确认，按 Esc 取消" : L"选区至少 64×64，请继续拖动调整";
-    const std::wstring instruction = ui::Text(instructionSource);
+    std::wstring instruction;
+    if (!state.hasSelection) {
+        instruction = ui::Text(ui::TextId::SelectRegionInstruction);
+    } else if (state.dragging) {
+        instruction = state.valid ? ui::Text(ui::TextId::AdjustRegionInstruction)
+            : ui::Format(ui::TextId::KeepDraggingMinimum, kMinOutputDimension, kMinOutputDimension);
+    } else {
+        instruction = state.valid ? ui::Text(ui::TextId::ConfirmRegionInstruction)
+            : ui::Format(ui::TextId::InvalidRegionInstruction, kMinOutputDimension, kMinOutputDimension);
+    }
     DrawLabel(overlay,
               (overlay.monitor.virtualRect.right - overlay.monitor.virtualRect.left) / 2,
               MulDiv(40, dpi, 96),
@@ -178,7 +176,7 @@ void RenderOverlay(Overlay& overlay, SelectionState& state) {
         const std::wstring sizeText = std::to_wstring(selectionWidth) + L" × " +
                                       std::to_wstring(selectionHeight) + L" px";
         const std::wstring text = state.valid
-            ? sizeText : sizeText + ui::Text(L"（至少 64×64）");
+            ? sizeText : sizeText + ui::Format(ui::TextId::MinimumRegionSuffix, kMinOutputDimension, kMinOutputDimension);
         const int centerX =
             state.currentScreen.x - overlay.monitor.virtualRect.left;
         int topY = state.currentScreen.y - overlay.monitor.virtualRect.top + MulDiv(24, dpi, 96);
@@ -217,21 +215,13 @@ void RenderOverlay(Overlay& overlay, SelectionState& state) {
         cancelButton.bottom + overlay.monitor.virtualRect.top,
     };
     const bool confirmEnabled = state.hasSelection && state.valid;
-    DrawButton(overlay, confirmButton, ui::Text(L"确定选择  Enter"),
+    DrawButton(overlay, confirmButton, ui::Text(ui::TextId::ConfirmRegionButton),
                ui::ButtonStyle::Primary, !confirmEnabled);
-    DrawButton(overlay, cancelButton, ui::Text(L"取消  Esc"), ui::ButtonStyle::Secondary);
+    DrawButton(overlay, cancelButton, ui::Text(ui::TextId::CancelRegionButton), ui::ButtonStyle::Secondary);
 
     std::wstring footer;
-    if (!state.hasSelection) {
-        footer.clear();
-    } else if (!state.valid || state.dragging) {
-        footer.clear();
-    } else {
-        footer = ui::IsEnglishLanguage()
-            ? L"Selected " + std::to_wstring(selectionWidth) + L"×" +
-                std::to_wstring(selectionHeight) + L" px"
-            : L"已选择 " + std::to_wstring(selectionWidth) + L"×" +
-                std::to_wstring(selectionHeight) + L" px";
+    if (state.hasSelection && state.valid && !state.dragging) {
+        footer = ui::Format(ui::TextId::SelectedRegionSize, selectionWidth, selectionHeight);
     }
     DrawLabel(overlay,
               (overlay.monitor.virtualRect.right - overlay.monitor.virtualRect.left) / 2,
@@ -257,8 +247,8 @@ void UpdateSelection(SelectionState& state, Overlay& overlay) {
     state.currentScreen = ClampToMonitor(overlay.monitor, state.currentScreen);
     state.selectionScreen = NormalizeRect(state.dragStartScreen, state.currentScreen);
     state.hasSelection = true;
-    state.valid = state.selectionScreen.right - state.selectionScreen.left >= kMinimumSize &&
-                  state.selectionScreen.bottom - state.selectionScreen.top >= kMinimumSize;
+    state.valid = state.selectionScreen.right - state.selectionScreen.left >= kMinOutputDimension &&
+                  state.selectionScreen.bottom - state.selectionScreen.top >= kMinOutputDimension;
     RenderAll(state);
 }
 

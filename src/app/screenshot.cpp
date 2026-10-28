@@ -73,10 +73,6 @@ bool CaptureFrame(HMONITOR monitor, const RECT& region, ScreenshotFrame& snapsho
         error = L"所选显示器已不可用，请重新选择";
         return false;
     }
-    if (IsAdvancedColorActive(*target)) {
-        error = L"目标显示器已启用 HDR/高级色彩。首版只支持 SDR，请切换到 SDR 后重试。";
-        return false;
-    }
     const int monitorWidth = target->virtualRect.right - target->virtualRect.left;
     const int monitorHeight = target->virtualRect.bottom - target->virtualRect.top;
     if (region.left < 0 || region.top < 0 || region.right <= region.left ||

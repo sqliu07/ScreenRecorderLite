@@ -1,6 +1,8 @@
 #include "platform/displays.h"
 
 #include <shellscalingapi.h>
+#include <dxgi1_6.h>
+#include <wrl/client.h>
 #include <winrt/base.h>
 
 #include <algorithm>
@@ -87,17 +89,106 @@ std::string OutputTechnologyName(DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY technolog
 struct TargetDisplayInfo {
     std::wstring friendlyName;
     std::wstring devicePath;
+    LUID adapterId{};
+    UINT32 targetId = 0;
     bool advancedColorSupported = false;
     bool advancedColorEnabled = false;
     bool wideColorEnforced = false;
     std::uint32_t bitsPerColorChannel = 0;
     DISPLAYCONFIG_COLOR_ENCODING colorEncoding = DISPLAYCONFIG_COLOR_ENCODING_RGB;
     bool colorInfoAvailable = false;
+    bool hdrEnabled = false;
+    bool hdrStateKnown = false;
+    float sdrWhiteScale = 1.0f;
     std::string outputTechnology;
 };
 
-std::unordered_map<std::wstring, TargetDisplayInfo> QueryTargetDisplays() {
-    std::unordered_map<std::wstring, TargetDisplayInfo> result;
+// INFO_2 is a runtime-optional Win11 query. Keep its SDK wire layout local so
+// builds with the supported Windows 10 SDK can still run on newer systems.
+struct AdvancedColorInfo2 {
+    DISPLAYCONFIG_DEVICE_INFO_HEADER header;
+    UINT32 flags;
+    DISPLAYCONFIG_COLOR_ENCODING colorEncoding;
+    UINT32 bitsPerColorChannel;
+    UINT32 activeColorMode;
+};
+constexpr auto kGetAdvancedColorInfo2 = static_cast<DISPLAYCONFIG_DEVICE_INFO_TYPE>(15);
+constexpr UINT32 kAdvancedColorSupported = 1U << 0;
+constexpr UINT32 kAdvancedColorActive = 1U << 1;
+constexpr UINT32 kColorModeWideGamut = 1;
+constexpr UINT32 kColorModeHdr = 2;
+constexpr float kSdrWhiteFixedPointDivisor = 1'000.0f;
+static_assert(sizeof(AdvancedColorInfo2) == 36);
+
+bool QueryTargetColor(TargetDisplayInfo& target) {
+    DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO legacy{};
+    legacy.header = {DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO,
+        sizeof(legacy), target.adapterId, target.targetId};
+    if (::DisplayConfigGetDeviceInfo(&legacy.header) == ERROR_SUCCESS) {
+        target.colorInfoAvailable = true;
+        target.advancedColorSupported = legacy.advancedColorSupported != 0;
+        target.advancedColorEnabled = legacy.advancedColorEnabled != 0;
+        target.wideColorEnforced = legacy.wideColorEnforced != 0;
+        target.bitsPerColorChannel = legacy.bitsPerColorChannel;
+        target.colorEncoding = legacy.colorEncoding;
+    }
+    AdvancedColorInfo2 current{};
+    current.header = {kGetAdvancedColorInfo2, sizeof(current), target.adapterId, target.targetId};
+    if (::DisplayConfigGetDeviceInfo(&current.header) == ERROR_SUCCESS) {
+        target.colorInfoAvailable = true;
+        target.hdrStateKnown = true;
+        target.advancedColorSupported = (current.flags & kAdvancedColorSupported) != 0;
+        target.advancedColorEnabled = (current.flags & kAdvancedColorActive) != 0;
+        target.wideColorEnforced = current.activeColorMode == kColorModeWideGamut;
+        target.hdrEnabled = current.activeColorMode == kColorModeHdr;
+        target.bitsPerColorChannel = current.bitsPerColorChannel;
+        target.colorEncoding = current.colorEncoding;
+    }
+    DISPLAYCONFIG_SDR_WHITE_LEVEL white{};
+    white.header = {DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL,
+        sizeof(white), target.adapterId, target.targetId};
+    if (::DisplayConfigGetDeviceInfo(&white.header) == ERROR_SUCCESS && white.SDRWhiteLevel > 0)
+        target.sdrWhiteScale = static_cast<float>(white.SDRWhiteLevel) / kSdrWhiteFixedPointDivisor;
+    return target.colorInfoAvailable;
+}
+
+std::optional<bool> QueryDxgiHdr(HMONITOR monitor) {
+    Microsoft::WRL::ComPtr<IDXGIFactory1> factory;
+    if (FAILED(::CreateDXGIFactory1(IID_PPV_ARGS(factory.GetAddressOf())))) return std::nullopt;
+    for (UINT adapterIndex = 0;; ++adapterIndex) {
+        Microsoft::WRL::ComPtr<IDXGIAdapter1> adapter;
+        if (factory->EnumAdapters1(adapterIndex, adapter.GetAddressOf()) == DXGI_ERROR_NOT_FOUND) break;
+        if (!adapter) continue;
+        for (UINT outputIndex = 0;; ++outputIndex) {
+            Microsoft::WRL::ComPtr<IDXGIOutput> output;
+            if (adapter->EnumOutputs(outputIndex, output.GetAddressOf()) == DXGI_ERROR_NOT_FOUND) break;
+            if (!output) continue;
+            DXGI_OUTPUT_DESC desc{};
+            if (FAILED(output->GetDesc(&desc)) || desc.Monitor != monitor) continue;
+            Microsoft::WRL::ComPtr<IDXGIOutput6> output6;
+            DXGI_OUTPUT_DESC1 color{};
+            if (SUCCEEDED(output.As(&output6)) && SUCCEEDED(output6->GetDesc1(&color)))
+                return color.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
+            return std::nullopt;
+        }
+    }
+    return std::nullopt;
+}
+
+void CopyTargetColor(const TargetDisplayInfo& target, MonitorInfo& monitor) {
+    monitor.advancedColorSupported = target.advancedColorSupported;
+    monitor.advancedColorEnabled = target.advancedColorEnabled;
+    monitor.wideColorEnforced = target.wideColorEnforced;
+    monitor.hdrEnabled = target.hdrEnabled;
+    monitor.hdrStateKnown = target.hdrStateKnown;
+    monitor.colorInfoAvailable = target.colorInfoAvailable;
+    monitor.sdrWhiteScale = target.sdrWhiteScale;
+    monitor.bitsPerColorChannel = target.bitsPerColorChannel;
+    monitor.colorEncoding = Utf8ToWide(ColorEncodingName(target.colorEncoding));
+}
+
+std::unordered_multimap<std::wstring, TargetDisplayInfo> QueryTargetDisplays() {
+    std::unordered_multimap<std::wstring, TargetDisplayInfo> result;
 
     UINT32 pathCount = 0;
     UINT32 modeCount = 0;
@@ -146,6 +237,8 @@ std::unordered_map<std::wstring, TargetDisplayInfo> QueryTargetDisplays() {
             ::DisplayConfigGetDeviceInfo(&targetName.header) == ERROR_SUCCESS;
 
         TargetDisplayInfo target;
+        target.adapterId = path.targetInfo.adapterId;
+        target.targetId = path.targetInfo.id;
         target.outputTechnology =
             OutputTechnologyName(static_cast<DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY>(
                 path.targetInfo.outputTechnology));
@@ -157,19 +250,7 @@ std::unordered_map<std::wstring, TargetDisplayInfo> QueryTargetDisplays() {
             }
         }
 
-        DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO colorInfo{};
-        colorInfo.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO;
-        colorInfo.header.size = sizeof(colorInfo);
-        colorInfo.header.adapterId = path.targetInfo.adapterId;
-        colorInfo.header.id = path.targetInfo.id;
-        if (::DisplayConfigGetDeviceInfo(&colorInfo.header) == ERROR_SUCCESS) {
-            target.colorInfoAvailable = true;
-            target.advancedColorSupported = colorInfo.advancedColorSupported != 0;
-            target.advancedColorEnabled = colorInfo.advancedColorEnabled != 0;
-            target.wideColorEnforced = colorInfo.wideColorEnforced != 0;
-            target.bitsPerColorChannel = colorInfo.bitsPerColorChannel;
-            target.colorEncoding = colorInfo.colorEncoding;
-        }
+        QueryTargetColor(target);
 
         result.emplace(ToUpper(sourceName.viewGdiDeviceName), std::move(target));
     }
@@ -208,8 +289,9 @@ BOOL CALLBACK MonitorEnumProc(HMONITOR monitor, HDC, LPRECT, LPARAM context) {
 
     DISPLAY_DEVICEW displayDevice{};
     displayDevice.cb = sizeof(displayDevice);
-    if (::EnumDisplayDevicesW(info.szDevice, 0, &displayDevice, 0)) {
+    if (::EnumDisplayDevicesW(info.szDevice, 0, &displayDevice, EDD_GET_DEVICE_INTERFACE_NAME)) {
         entry.friendlyName = displayDevice.DeviceString;
+        entry.devicePath = displayDevice.DeviceID;
     }
     if (entry.friendlyName.empty()) {
         entry.friendlyName = info.szDevice;
@@ -242,21 +324,34 @@ std::vector<MonitorInfo> EnumerateDisplays() {
         MonitorInfo& monitor = monitors[i];
         monitor.index = static_cast<int>(i) + 1;
 
-        const auto found = targets.find(ToUpper(monitor.deviceName));
-        if (found == targets.end()) {
-            continue;
+        const auto [first, last] = targets.equal_range(ToUpper(monitor.deviceName));
+        auto found = first;
+        // Cloned targets can share one source name. Prefer the target interface
+        // reported for this HMONITOR instead of silently taking a different one.
+        for (auto candidate = first; candidate != last; ++candidate) {
+            if (!monitor.devicePath.empty() &&
+                ToUpper(candidate->second.devicePath) == ToUpper(monitor.devicePath)) {
+                found = candidate;
+                break;
+            }
         }
-        const TargetDisplayInfo& target = found->second;
-        if (!target.friendlyName.empty()) {
-            monitor.friendlyName = target.friendlyName;
+        if (found != last) {
+            const TargetDisplayInfo& target = found->second;
+            if (!target.friendlyName.empty()) monitor.friendlyName = target.friendlyName;
+            monitor.devicePath = target.devicePath;
+            monitor.outputTechnology = Utf8ToWide(target.outputTechnology);
+            monitor.targetAdapterId = target.adapterId;
+            monitor.targetId = target.targetId;
+            monitor.hasDisplayConfigTarget = true;
+            CopyTargetColor(target, monitor);
         }
-        monitor.devicePath = target.devicePath;
-        monitor.outputTechnology = Utf8ToWide(target.outputTechnology);
-        monitor.advancedColorSupported = target.advancedColorSupported;
-        monitor.advancedColorEnabled = target.advancedColorEnabled;
-        monitor.wideColorEnforced = target.wideColorEnforced;
-        monitor.bitsPerColorChannel = target.bitsPerColorChannel;
-        monitor.colorEncoding = Utf8ToWide(ColorEncodingName(target.colorEncoding));
+        if (!monitor.hdrStateKnown) {
+            if (const auto hdr = QueryDxgiHdr(monitor.handle)) {
+                monitor.hdrStateKnown = true;
+                monitor.hdrEnabled = *hdr;
+            }
+        }
+
     }
     return monitors;
 }
@@ -271,8 +366,25 @@ const MonitorInfo* PrimaryMonitor(const std::vector<MonitorInfo>& displays) {
 }
 
 bool IsAdvancedColorActive(const MonitorInfo& monitor) {
-    return (monitor.advancedColorSupported && monitor.advancedColorEnabled) ||
-           monitor.wideColorEnforced;
+    return monitor.advancedColorEnabled || monitor.wideColorEnforced || monitor.hdrEnabled;
+}
+
+bool IsHdrActive(const MonitorInfo& monitor) { return monitor.hdrEnabled; }
+
+bool RefreshDisplayColor(MonitorInfo& monitor) {
+    if (!monitor.hasDisplayConfigTarget) return false;
+    TargetDisplayInfo target;
+    target.adapterId = monitor.targetAdapterId;
+    target.targetId = monitor.targetId;
+    if (!QueryTargetColor(target)) return false;
+    CopyTargetColor(target, monitor);
+    if (!monitor.hdrStateKnown) {
+        if (const auto hdr = QueryDxgiHdr(monitor.handle)) {
+            monitor.hdrStateKnown = true;
+            monitor.hdrEnabled = *hdr;
+        }
+    }
+    return true;
 }
 
 void PrintDisplays(const std::vector<MonitorInfo>& displays) {
@@ -310,7 +422,8 @@ void PrintDisplays(const std::vector<MonitorInfo>& displays) {
             colorEncoding, monitor.advancedColorSupported ? 1 : 0,
             monitor.advancedColorEnabled ? 1 : 0, monitor.wideColorEnforced ? 1 : 0,
             bitDepth,
-            IsAdvancedColorActive(monitor) ? "  [SDR capture blocked]" : "  [SDR]"));
+            monitor.hdrEnabled ? "  [HDR, tone-mapped to SDR]"
+                : IsAdvancedColorActive(monitor) ? "  [WCG/advanced color]" : "  [SDR]"));
         if (!monitor.devicePath.empty()) {
             ConsoleLine(std::format("      path {}", WideToUtf8(monitor.devicePath)));
         }

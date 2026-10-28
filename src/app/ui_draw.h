@@ -25,6 +25,7 @@ void DrawLayeredButton(HDC dc, std::uint32_t* pixels, int width, int height,
                        ButtonStyle style, UINT dpi, bool disabled);
 
 void DrawModernButton(const DRAWITEMSTRUCT& item, ButtonStyle style, UINT dpi);
+void DrawRecordingIndicator(HDC dc, const RECT& rect, bool recording);
 void DrawRoundedPanel(HDC dc, const RECT& rect, COLORREF fill, COLORREF border,
                       int radiusPx);
 

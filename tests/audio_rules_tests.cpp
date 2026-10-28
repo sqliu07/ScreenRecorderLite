@@ -16,7 +16,27 @@ void Check(bool condition, const char* message) {
     }
 }
 
+void TestRecordingFormat() {
+    Check(srl::kAudioPcmBitsPerSample == 16 && srl::kAudioPcmBytesPerSample == 2 &&
+              srl::kAudioPcmBlockAlignment == 4 && srl::kAudioPcmBytesPerSecond == 192'000,
+          "output PCM stays 16-bit stereo at 1536 kbps");
+    Check(srl::kAudioBitrateBps == 128'000 && srl::kAudioEncodedBytesPerSecond == 16'000,
+          "each AAC track retains the 128 kbps target");
+    Check(srl::kAudioTrackCount == 3 &&
+              static_cast<std::uint32_t>(srl::AudioTrack::Mixed) == 0 &&
+              static_cast<std::uint32_t>(srl::AudioTrack::System) == 1 &&
+              static_cast<std::uint32_t>(srl::AudioTrack::Microphone) == 2,
+          "the default mixed track precedes system and microphone tracks");
+    Check(srl::kHundredNanosecondsPerSecond == 10'000'000 &&
+              srl::kHundredNanosecondsPerMillisecond == 10'000,
+          "the common media clock uses 100 ns units");
+}
+
 void TestQueueBudget() {
+    Check(srl::kAudioOutputRate == 48'000 && srl::kAudioOutputChannels == 2,
+          "capture output remains 48 kHz stereo");
+    Check(srl::kAudioMaxQueuedFrames == 24'000,
+          "audio queue capacity remains exactly 500 ms at the output rate");
     Check(srl::AudioFrameCount(960) == 480,
           "10 ms stereo PCM16 contains 480 frames, not 240");
 
@@ -69,6 +89,7 @@ void TestTimestampValidation() {
 }  // namespace
 
 int main() {
+    TestRecordingFormat();
     TestQueueBudget();
     TestTimestampValidation();
     std::printf("%d checks, %d failure(s)\n", checks, failures);
